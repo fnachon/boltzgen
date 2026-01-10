@@ -355,7 +355,7 @@ class TemplateModule(nn.Module):
         asym_mask = asym_mask[:, None].expand(-1, T, -1, -1)
 
         # Compute template features
-        with torch.autocast(device_type="cuda", enabled=False):
+        with torch.autocast(device_type=cb_coords.device.type, enabled=False):
             # Compute distogram
             cb_dists = torch.cdist(cb_coords, cb_coords)
             boundaries = torch.linspace(self.min_dist, self.max_dist, self.num_bins - 1)
@@ -504,7 +504,7 @@ class TokenDistanceModule(nn.Module):
         token_coords = feats["center_coords"]
 
         # Compute template features
-        with torch.autocast(device_type="cuda", enabled=False):
+        with torch.autocast(device_type=token_coords.device.type, enabled=False):
             # Compute distogram
             dists = torch.cdist(token_coords, token_coords)
             boundaries = torch.linspace(self.min_dist, self.max_dist, self.num_bins - 1)

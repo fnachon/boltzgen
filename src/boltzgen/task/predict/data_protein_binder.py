@@ -584,6 +584,8 @@ class ProteinBinderDataModule(pl.LightningDataModule):
                 "extra_mols",
                 "data_sample_idx",
             ]:
+                if torch.is_tensor(batch[key]) and batch[key].dtype == torch.float64 and torch.backends.mps.is_available():
+                    batch[key] = batch[key].float()
                 batch[key] = batch[key].to(device)
         return batch
 
