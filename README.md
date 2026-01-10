@@ -4,7 +4,8 @@
   <img src="assets/boltzgen.png" alt="BoltzGen logo" width="60%">
 
 [Paper](https://hannes-stark.com/assets/boltzgen.pdf) | 
-[Slack](https://boltz.bio/join-slack) <br> <br>
+[Slack](https://boltz.bio/join-slack) | 
+[Video](https://www.youtube.com/watch?v=9d_QWUUI1Qo) <br> <br>
  ![alt text](assets/cover.png)
 </div>
 
@@ -194,6 +195,7 @@ We provide many example `.yaml` files in the `example/` directory, including:
 - `example/fab_targets/pdl1.yaml`
 - `example/denovo_zinc_finger_against_dna/zinc_finger.yaml`
 - `example/protein_binding_small_molecule/chorismite.yaml`
+- `example/small_molecule_from_file_and_smiles/4g37.yaml`
 
 Small example of a protein design against a target protein without binding site specified:
 ```yaml

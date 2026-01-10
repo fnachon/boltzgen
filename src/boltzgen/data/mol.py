@@ -654,12 +654,16 @@ def get_chain_symmetries(cropped, backbone_only, atom14, atom37, max_n_symmetrie
         crop_to_all_atom_map.shape[0]
     )
     connections_edge_index = []
+    crop_atom_set = set(crop_to_all_atom_map.astype(np.int64))
     for connection in structure.bonds:
         if (connection["chain_1"] == connection["chain_2"]) and (
             connection["res_1"] == connection["res_2"]
         ):
             continue
-        connections_edge_index.append([connection["atom_1"], connection["atom_2"]])
+        atom_1, atom_2 = connection["atom_1"], connection["atom_2"]
+        # Only include bonds where BOTH atoms are in the crop
+        if atom_1 in crop_atom_set and atom_2 in crop_atom_set:
+            connections_edge_index.append([atom_1, atom_2])
     if len(connections_edge_index) > 0:
         connections_edge_index = np.array(connections_edge_index, dtype=np.int64).T
         connections_edge_index = all_atom_to_crop_map[connections_edge_index]

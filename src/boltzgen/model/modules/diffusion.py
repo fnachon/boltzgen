@@ -829,7 +829,7 @@ class AtomDiffusion(Module):
 
             if add_bond_loss:
                 bond_loss, num_bonds = compute_bond_loss(
-                    pred_atom_coords=out_dict["sample_atom_coords"].float(),
+                    pred_atom_coords=out_dict["denoised_atom_coords"].float(),
                     true_coords=atom_coords_aligned_ground_truth,
                     feats=feats,
                 )
