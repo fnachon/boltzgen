@@ -104,6 +104,7 @@ class Analyze(Task):
         foldseek_binary: str = "/data/rbg/users/hstark/foldseek/bin/foldseek",
         skip_specific_ids: List[str] = None,
         designfolding_metrics: bool = False,
+        use_design_mask_for_target: bool = False,
     ) -> None:
         """Initialize the task.
 
@@ -152,6 +153,7 @@ class Analyze(Task):
         self.wandb = wandb
         self.slurm = slurm
         self.diversity_subset = diversity_subset
+        self.use_design_mask_for_target = use_design_mask_for_target
 
         # Prevent each worker process from spawning its own multithreaded pools
         torch.set_num_threads(1)
@@ -603,7 +605,12 @@ class Analyze(Task):
 
         design_resolved_mask = design_mask & feat["token_resolved_mask"].bool()
 
-        target_resolved_mask = (~chain_design_mask) & feat["token_resolved_mask"].bool()
+        # For symmetric designs where all chains have designed residues, use design_mask
+        # instead of chain_design_mask so "target" = non-designed residues (not empty)
+        if self.use_design_mask_for_target:
+            target_resolved_mask = (~design_mask) & feat["token_resolved_mask"].bool()
+        else:
+            target_resolved_mask = (~chain_design_mask) & feat["token_resolved_mask"].bool()
         atom_design_resolved_mask = (
             (feat["atom_to_token"].float() @ design_resolved_mask.unsqueeze(-1).float())
             .bool()
@@ -1135,6 +1142,13 @@ class Analyze(Task):
                 metrics["affinity_probability_binary1>75"] = (
                     metrics["affinity_probability_binary1"] > 0.75
                 )
+        
+        for key in const.eval_keys_confidence:
+            if key in feat:
+                if isinstance(feat[key], torch.Tensor) and feat[key].numel() == 1:
+                    metrics[key] = feat[key].item()
+                elif isinstance(feat[key], (float, int)):
+                    metrics[key] = feat[key]
 
         # Write outputs to files and return sample_id for conformation of successful processing
         data = {

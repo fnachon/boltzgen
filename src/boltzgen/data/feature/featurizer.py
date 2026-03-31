@@ -701,6 +701,12 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     res_type = from_numpy(token_data["res_type"]).long()
     is_standard = from_numpy(token_data["is_standard"])
     design = from_numpy(token_data["design_mask"]).long()
+    # Per-residue amino acid constraint mask (shape: num_tokens x 20)
+    if "aa_constraint_mask" in token_data.dtype.names:
+        aa_constraint_mask = from_numpy(token_data["aa_constraint_mask"]).float()
+    else:
+        # Default: no constraints (all zeros = all AAs allowed)
+        aa_constraint_mask = torch.zeros(len(token_data), len(const.canonical_tokens))
     res_type = one_hot(res_type, num_classes=const.num_tokens)
     modified = from_numpy(token_data["modified"]).long()
     ccd = from_numpy(token_data["ccd"]).long()
@@ -711,6 +717,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     design_ss_mask = from_numpy(token_data["design_ss_mask"])
     feature_residue_index = from_numpy(token_data["feature_res_idx"]).long()
     feature_asym_id = from_numpy(token_data["feature_asym_id"]).long()
+    symmetric_group = from_numpy(token_data["symmetric_group"]).long()
     token_to_res = from_numpy(data.token_to_res).long()
 
     method = (
@@ -863,6 +870,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
             res_type = pad_dim(res_type, 0, pad_len)
             is_standard = pad_dim(is_standard, 0, pad_len)
             design = pad_dim(design, 0, pad_len)
+            aa_constraint_mask = pad_dim(aa_constraint_mask, 0, pad_len)
             binding_type = pad_dim(binding_type, 0, pad_len)
             structure_group = pad_dim(structure_group, 0, pad_len)
             pad_mask = pad_dim(pad_mask, 0, pad_len)
@@ -887,6 +895,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
             design_ss_mask = pad_dim(design_ss_mask, 0, pad_len)
             feature_residue_index = pad_dim(feature_residue_index, 0, pad_len)
             feature_asym_id = pad_dim(feature_asym_id, 0, pad_len)
+            symmetric_group = pad_dim(symmetric_group, 0, pad_len)
             token_to_res = pad_dim(token_to_res, 0, pad_len)
     token_features = {
         "token_index": token_index,
@@ -899,6 +908,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         "res_type_clone": res_type.clone(),
         "is_standard": is_standard,
         "design_mask": design,
+        "aa_constraint_mask": aa_constraint_mask,
         "binding_type": binding_type,
         "structure_group": structure_group,
         "token_bonds": bonds,
@@ -921,6 +931,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         "design_ss_mask": design_ss_mask,
         "feature_residue_index": feature_residue_index,
         "feature_asym_id": feature_asym_id,
+        "symmetric_group": symmetric_group,
         "ligand_affinity_mask": ligand_affinity_mask,
         "token_to_res": token_to_res,
     }

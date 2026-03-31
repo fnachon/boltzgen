@@ -30,7 +30,7 @@ data:
   fail_if_no_designs: true
   output_dir: null
   
-keys_dict_out: ["min_interaction_pae", "min_design_to_target_pae", "interaction_pae", "ligand_iptm", "protein_iptm", "iptm", "design_iptm", "design_iiptm", "design_to_target_iptm", "design_ptm", "target_ptm", "ptm"]
+keys_dict_out: ["min_interaction_pae", "min_design_to_target_pae", "interaction_pae", "ligand_iptm", "protein_iptm", "iptm", "design_iptm", "design_iiptm", "design_to_target_iptm", "design_residue_iptm", "design_ptm", "target_ptm", "ptm"]
 
 writer:
   _target_: boltzgen.task.predict.writer.FoldingWriter

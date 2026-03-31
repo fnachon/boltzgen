@@ -8,6 +8,26 @@ from boltzgen.data import const
 from boltzgen.data.data import Structure, elem_from_name
 
 
+def _create_gemmi_model(model_num: int) -> gemmi.Model:
+    """Create a gemmi.Model compatible with both gemmi 0.6.x and 0.7.x.
+
+    In gemmi 0.7.0, the Model constructor changed from taking a string name
+    to taking an integer number (Model.name -> Model.num).
+
+    Args:
+        model_num: The model number (typically 1).
+
+    Returns:
+        A gemmi.Model instance.
+    """
+    try:
+        # gemmi 0.7.x: Model(int) constructor with Model.num property
+        return gemmi.Model(model_num)
+    except TypeError:
+        # gemmi 0.6.x: Model(str) constructor with Model.name property
+        return gemmi.Model(str(model_num))
+
+
 def to_mmcif(
     structure: Structure,
     write_fake_atoms: bool = False,
@@ -35,7 +55,7 @@ def to_mmcif(
 
     gemmi_struct = gemmi.Structure()
     gemmi_struct.name = "model"
-    model = gemmi.Model("1")
+    model = _create_gemmi_model(1)
 
     chain_to_entity_id = {}
     sequence_to_entity_id = {}

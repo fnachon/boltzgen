@@ -144,6 +144,7 @@ class ParsedChain:
     cyclic_period: int
     sequence: Optional[str] = None
     sampleidx_to_specidx: Optional[np.ndarray] = None
+    symmetric_group: int = 0
 
 
 @dataclass(frozen=True)
@@ -335,6 +336,12 @@ yaml_keys = [
     "leaving_atoms",
     "atom",
     "use_assembly",
+    "symmetric_group",
+    # Per-residue amino acid constraints
+    "residue_constraints",
+    "position",
+    "allowed",
+    "disallowed",
 ]
 
 
@@ -483,6 +490,7 @@ def parse_polymer(
     components: dict[str, Mol],
     cyclic: bool,
     mol_dir: Path,
+    symmetric_group: int = 0,
 ) -> Optional[ParsedChain]:
     """Process a sequence into a chain object.
 
@@ -630,6 +638,7 @@ def parse_polymer(
         cyclic_period=cyclic_period,
         sequence=raw_sequence,
         sampleidx_to_specidx=sampleidx_to_specidx,
+        symmetric_group=symmetric_group,
     )
 
 
@@ -665,14 +674,194 @@ def parse_range(ranges, c_start=0, c_end=None):
             start -= 1
             end = c_end - c_start
             indices += list(range(c_start + start, c_end))
-    if start < 0:
-        msg = f"There is a 0 in the specified range(s) {ranges}. Residue indices are 1 indexed."
-        raise ValueError(msg)
+        else:
+            msg = f"Malformed residue range specification '{spec}' in '{ranges}'."
+            raise ValueError(msg)
 
-    if c_end is not None and end > c_end - c_start:
-        msg = f"Specified end {ranges} is higher than the length of the chain."
-        raise ValueError(msg)
+        if start < 0:
+            msg = f"There is a 0 in the specified range(s) {ranges}. Residue indices are 1 indexed."
+            raise ValueError(msg)
+
+        if c_end is not None and end > c_end - c_start:
+            msg = f"Specified end {ranges} is higher than the length of the chain."
+            raise ValueError(msg)
     return indices
+
+
+def _normalize_aa_spec(aa_spec) -> list[str]:
+    """Normalize amino acid specification to a list of individual codes.
+
+    Supports both BoltzGen conventions:
+    - String format: "AGS" (concatenated 1-letter codes, consistent with sequence/binding_types)
+    - List format: [A, G, S] or [ALA, GLY, SER]
+
+    Parameters
+    ----------
+    aa_spec : str or list
+        Amino acid specification in string or list format
+
+    Returns
+    -------
+    list[str]
+        List of individual amino acid codes
+    """
+    if isinstance(aa_spec, str):
+        # String format: "AGS" -> ["A", "G", "S"]
+        # Handle both "AGS" and "ALA" (single 3-letter code)
+        aa_spec = aa_spec.strip().upper()
+        if len(aa_spec) <= 3 and aa_spec.isalpha():
+            # Could be single 3-letter code like "ALA" or 1-3 single letters like "A", "AG", "AGS"
+            # Check if it's a valid 3-letter code
+            if len(aa_spec) == 3 and aa_spec in ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"]:
+                return [aa_spec]
+            # Otherwise treat as concatenated 1-letter codes
+            return list(aa_spec)
+        else:
+            # Longer string: treat as concatenated 1-letter codes
+            return list(aa_spec)
+    elif isinstance(aa_spec, list):
+        # List format: [A, G, S] or [ALA, GLY, SER]
+        return [str(x).strip().upper() for x in aa_spec]
+    else:
+        raise ValueError(f"Invalid amino acid specification: {aa_spec}")
+
+
+def _convert_aa_names_to_indices(
+    aa_names: list,
+    canonical_tokens: list[str],
+    prot_letter_to_token: dict[str, str],
+) -> list[int]:
+    """Convert amino acid names (1-letter or 3-letter) to canonical token indices.
+
+    Parameters
+    ----------
+    aa_names : list
+        List of amino acid names (1-letter like 'A' or 3-letter like 'ALA')
+    canonical_tokens : list[str]
+        List of canonical 3-letter amino acid codes
+    prot_letter_to_token : dict[str, str]
+        Mapping from 1-letter to 3-letter codes
+
+    Returns
+    -------
+    list[int]
+        List of indices into canonical_tokens
+    """
+    indices = []
+    for name in aa_names:
+        name = str(name).strip().upper()
+        # Convert 1-letter to 3-letter if needed
+        if len(name) == 1:
+            if name not in prot_letter_to_token:
+                raise ValueError(f"Unknown amino acid code: {name}")
+            name = prot_letter_to_token[name]
+
+        # Find index in canonical_tokens
+        if name not in canonical_tokens:
+            raise ValueError(f"Unknown amino acid: {name}")
+        indices.append(canonical_tokens.index(name))
+
+    return indices
+
+
+def parse_residue_constraints(
+    constraints_spec: list,
+    chain_length: int,
+    canonical_tokens: list[str],
+    prot_letter_to_token: dict[str, str],
+) -> np.ndarray:
+    """Parse residue_constraints into a per-residue constraint mask.
+
+    Parameters
+    ----------
+    constraints_spec : list
+        List of constraint specifications from YAML
+    chain_length : int
+        Length of the chain (number of residues)
+    canonical_tokens : list[str]
+        List of canonical 3-letter amino acid codes (20 AAs)
+    prot_letter_to_token : dict[str, str]
+        Mapping from 1-letter to 3-letter codes
+
+    Returns
+    -------
+    np.ndarray
+        Shape (chain_length, 20) where:
+        - 0.0 means allowed
+        - 1.0 means disallowed (will be converted to -inf logit bias in model)
+
+    Notes
+    -----
+    Overlapping constraints use **intersection** semantics: if multiple
+    constraints cover the same position, only amino acids allowed by ALL
+    of them survive. For example, ``allowed: AG`` at pos 1..10 followed
+    by ``allowed: GS`` at pos 5..15 results in only G being allowed at
+    positions 5-10 (the intersection of {A,G} and {G,S}).
+    """
+    num_aa = len(canonical_tokens)  # Should be 20
+    constraint_mask = np.zeros((chain_length, num_aa), dtype=np.float32)
+
+    for constraint in constraints_spec:
+        # Parse position(s)
+        position_spec = constraint.get("position")
+        if position_spec is None:
+            raise ValueError("residue_constraints: 'position' is required")
+
+        # Use parse_range to handle single positions and ranges (1-indexed)
+        positions = parse_range(str(position_spec), c_start=0, c_end=chain_length)
+
+        # Validate positions are within bounds
+        for pos in positions:
+            if pos < 0 or pos >= chain_length:
+                raise ValueError(
+                    f"Position {pos + 1} is out of bounds for chain of length {chain_length}"
+                )
+
+        # Parse amino acid specification
+        allowed = constraint.get("allowed", None)
+        disallowed = constraint.get("disallowed", None)
+
+        # Validate: cannot have both allowed and disallowed
+        if allowed is not None and disallowed is not None:
+            raise ValueError(
+                f"Position {position_spec}: cannot specify both 'allowed' and 'disallowed'"
+            )
+
+        if allowed is None and disallowed is None:
+            raise ValueError(
+                f"Position {position_spec}: must specify either 'allowed' or 'disallowed'"
+            )
+
+        if allowed is not None:
+            # Whitelist mode: block all except specified AAs
+            # Uses np.maximum to accumulate with existing constraints (intersection semantics):
+            # if a position already has constraints, only AAs allowed by BOTH survive.
+            aa_list = _normalize_aa_spec(allowed)
+            if len(aa_list) == 0:
+                raise ValueError(
+                    f"Position {position_spec}: 'allowed' cannot be empty"
+                )
+            aa_indices = _convert_aa_names_to_indices(
+                aa_list, canonical_tokens, prot_letter_to_token
+            )
+            new_block = np.ones(num_aa, dtype=np.float32)
+            for idx in aa_indices:
+                new_block[idx] = 0.0
+            for pos in positions:
+                constraint_mask[pos, :] = np.maximum(constraint_mask[pos, :], new_block)
+
+        elif disallowed is not None:
+            # Blacklist mode: only block specified
+            # Normalize input: supports both "CM" (string) and [C, M] (list)
+            aa_list = _normalize_aa_spec(disallowed)
+            aa_indices = _convert_aa_names_to_indices(
+                aa_list, canonical_tokens, prot_letter_to_token
+            )
+            for pos in positions:
+                for idx in aa_indices:
+                    constraint_mask[pos, idx] = 1.0  # Block specified
+
+    return constraint_mask
 
 
 def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
@@ -766,6 +955,9 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
             seq[idx] = code
 
         cyclic = item[entity_type].get("cyclic", False)
+        symmetric_group = item[entity_type].get("symmetric_group", 0)
+        if symmetric_group is None:
+            symmetric_group = 0
 
         # Parse a polymer
         parsed_chain = parse_polymer(
@@ -776,10 +968,14 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
             components=mols,
             cyclic=cyclic,
             mol_dir=mol_dir,
+            symmetric_group=symmetric_group,
         )
 
     # Parse a non-polymer
     elif (entity_type == "ligand") and "ccd" in (item[entity_type]):
+        symmetric_group = item[entity_type].get("symmetric_group", 0)
+        if symmetric_group is None:
+            symmetric_group = 0
         seq = item[entity_type]["ccd"]
         if isinstance(seq, str):
             seq = [seq]
@@ -806,6 +1002,7 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
             type=const.chain_type_ids["NONPOLYMER"],
             cyclic_period=0,
             sequence=None,
+            symmetric_group=symmetric_group,
         )
 
         assert not item[entity_type].get("cyclic", False), (
@@ -813,6 +1010,9 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
         )
 
     elif (entity_type == "ligand") and ("smiles" in item[entity_type]):
+        symmetric_group = item[entity_type].get("symmetric_group", 0)
+        if symmetric_group is None:
+            symmetric_group = 0
         seq = item[entity_type]["smiles"]
         mol = AllChem.MolFromSmiles(seq)
         mol = AllChem.AddHs(mol)
@@ -848,6 +1048,7 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
             type=const.chain_type_ids["NONPOLYMER"],
             cyclic_period=0,
             sequence=None,
+            symmetric_group=symmetric_group,
         )
 
         assert not item[entity_type].get("cyclic", False), (
@@ -944,6 +1145,31 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
         else:
             ss_type.extend([const.ss_type_ids["UNSPECIFIED"]] * num)
 
+    # Parse residue_constraints for per-residue amino acid restrictions
+    entry = item[entity_type]
+    constraints_spec = entry.get("residue_constraints", None)
+    ids = item[entity_type]["id"]
+    num_chains = 1 if isinstance(ids, str) else len(ids)
+    res_aa_constraint_list = []
+    for _ in range(num_chains):
+        if constraints_spec is not None and entity_type == "protein":
+            res_aa_constraints = parse_residue_constraints(
+                constraints_spec,
+                chain_length=num,
+                canonical_tokens=const.canonical_tokens,
+                prot_letter_to_token=const.prot_letter_to_token,
+            )
+        else:
+            # No constraints: all 20 amino acids allowed (zeros)
+            res_aa_constraints = np.zeros((num, len(const.canonical_tokens)), dtype=np.float32)
+        res_aa_constraint_list.append(res_aa_constraints)
+
+    # Concatenate constraint masks for all chain copies
+    if res_aa_constraint_list:
+        res_aa_constraint_mask = np.concatenate(res_aa_constraint_list, axis=0)
+    else:
+        res_aa_constraint_mask = np.zeros((0, len(const.canonical_tokens)), dtype=np.float32)
+
     # Add as many parsed_chains as provided ids
     if entity_type in {"protein", "dna", "rna", "ligand"}:
         ids = item[entity_type]["id"]
@@ -971,6 +1197,7 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
         chain_to_msa,
         fuse_info,
         ligand_id,
+        res_aa_constraint_mask,
     )
 
 
@@ -1202,6 +1429,7 @@ class YamlDesignParser:
             res_design_mask = np.array([], dtype=bool)
             res_bind_type = np.array([], dtype=np.int32)
             ss_type = np.array([], dtype=np.int32)
+            res_aa_constraint_mask = np.zeros((0, len(const.canonical_tokens)), dtype=np.float32)
             chain_to_msa = {}
 
             global_asym_id = 0
@@ -1225,6 +1453,7 @@ class YamlDesignParser:
                         entity_chain_to_msa,
                         fuse_info,
                         ligand_id,
+                        new_res_aa_constraint_mask,
                     ) = parse_entity(
                         item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto
                     )
@@ -1233,6 +1462,7 @@ class YamlDesignParser:
                     extra_mols.update(new_extra_mols)
                     res_bind_type = np.concatenate([res_bind_type, new_res_bind_type])
                     ss_type = np.concatenate([ss_type, new_ss_type])
+                    res_aa_constraint_mask = np.concatenate([res_aa_constraint_mask, new_res_aa_constraint_mask], axis=0)
                     for asym_id, (chain_name, chain) in enumerate(
                         parsed_chains.items()
                     ):
@@ -1260,6 +1490,7 @@ class YamlDesignParser:
                                 res_idx,
                                 res_num,
                                 chain.cyclic_period,
+                                chain.symmetric_group,
                             )
                         )
                         chain_to_idx[chain_name] = asym_id
@@ -1405,11 +1636,16 @@ class YamlDesignParser:
                         fbind_types,
                         fss_type,
                         file_chain_to_msa,
+                        file_chain_symmetric_group,
                         fuse_info,
                         new_extra_mols,
                         file_msa_flag,
                         ligand_id,
                     ) = self.parse_file(item, mols, mol_dir, ligand_id, base_file_path)
+                    # Apply symmetric_group to chains from file
+                    for chain_id, sym_group in file_chain_symmetric_group.items():
+                        chain_mask = new_data.chains["name"] == chain_id
+                        new_data.chains["symmetric_group"][chain_mask] = sym_group
                     if fuse_info["fuse"]:
                         if fuse_info["target_id"] in total_renaming.keys():
                             fuse_info["target_id"] = total_renaming[
@@ -1430,6 +1666,9 @@ class YamlDesignParser:
                     res_design_mask = np.concatenate([res_design_mask, new_design_mask])
                     res_bind_type = np.concatenate([res_bind_type, fbind_types])
                     ss_type = np.concatenate([ss_type, fss_type])
+                    # File entities have no residue constraints — pad with zeros (all AAs allowed)
+                    file_constraint_mask = np.zeros((len(new_design_mask), len(const.canonical_tokens)), dtype=np.float32)
+                    res_aa_constraint_mask = np.concatenate([res_aa_constraint_mask, file_constraint_mask], axis=0)
                     extra_mols.update(new_extra_mols)
                     if len(renaming) > 0:
                         msg = f"\nChain ids conflict with existing chain ids. Renaming with {renaming}. This is for the structure from '{path}'."
@@ -1599,6 +1838,7 @@ class YamlDesignParser:
             res_structure_groups=structure_groups,
             res_binding_type=res_bind_type,
             res_ss_types=ss_type,
+            res_aa_constraint_mask=res_aa_constraint_mask,
         )
         DesignInfo.is_valid(design_info)
 
@@ -1698,6 +1938,7 @@ class YamlDesignParser:
 
         # Construct include mask from include entries
         file_chain_to_msa = {}
+        file_chain_symmetric_group = {}
         if isinstance(include, str):
             if include == "all":
                 include_mask = np.ones(num_res)
@@ -1712,12 +1953,15 @@ class YamlDesignParser:
                     msg = f"Misspecified chain in include with missing 'id' for file with path {path}."
                     raise ValueError(msg)
                 chain_id = chain["id"]
+
                 if chain_id not in structure.chains["name"]:
                     msg = f"Specified chain id {chain_id} not in file {path}."
                     raise ValueError(msg)
 
                 if "msa" in chain:
                     file_chain_to_msa[chain_id] = chain["msa"]
+                if "symmetric_group" in chain:
+                    file_chain_symmetric_group[chain_id] = chain["symmetric_group"]
                 data_chain = structure.chains[structure.chains["name"] == chain_id]
 
                 c_start = data_chain["res_idx"].item()
@@ -2017,8 +2261,12 @@ class YamlDesignParser:
                         fss_type[indices] = const.ss_type_ids["SHEET"]
 
         # Parse and apply design insertions
+        # First pass: collect insertions and coordinate lengths for symmetric chains
         if design_insertions is not None:
             num_inserted = defaultdict(int)
+            # Group insertions by (symmetric_group, res_index) to coordinate variable lengths
+            symmetric_length_cache = {}  # (sym_group, res_index) -> sampled_length
+
             for list_element in design_insertions:
                 insertion = list_element["insertion"]
                 if "id" not in insertion:
@@ -2032,10 +2280,24 @@ class YamlDesignParser:
                 res_index += num_inserted[chain_id]
                 ss_insert_type = insertion.get("secondary_structure", "UNSPECIFIED")
 
+                num_residues_spec = insertion["num_residues"]
+                num_residues_range = parse_range(num_residues_spec)
+
+                # Check if this chain has a symmetric_group
+                chain_sym_group = file_chain_symmetric_group.get(chain_id, 0)
+
+                # If chain has symmetric_group > 0, coordinate length with other symmetric chains
+                if chain_sym_group > 0:
+                    cache_key = (chain_sym_group, res_index, str(num_residues_spec))
+                    if cache_key in symmetric_length_cache:
+                        num_residues = symmetric_length_cache[cache_key]
+                    else:
+                        num_residues = np.random.choice(num_residues_range).item()
+                        symmetric_length_cache[cache_key] = num_residues
+                else:
+                    num_residues = np.random.choice(num_residues_range).item()
+
                 # We add +1 because the parse_range function is usually used for indexing where we then convert the 1 based inputs to 0 indexing
-                num_residues = insertion["num_residues"]
-                num_residues = parse_range(num_residues)
-                num_residues = np.random.choice(num_residues).item()
                 num_residues += 1
                 num_inserted[chain_id] += num_residues
 
@@ -2169,6 +2431,7 @@ class YamlDesignParser:
             fbind_types,
             fss_type,
             file_chain_to_msa,
+            file_chain_symmetric_group,
             fuse_info,
             extra_mols,
             file_msa_flag,

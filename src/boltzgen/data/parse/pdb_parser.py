@@ -117,6 +117,7 @@ def patch_chain_names(structure: ParsedStructure) -> ParsedStructure:
                 chain["res_idx"],
                 chain["res_num"],
                 chain["cyclic_period"],
+                chain["symmetric_group"],
             )
         )
     chains_new = np.array(chains_new, dtype=Chain)

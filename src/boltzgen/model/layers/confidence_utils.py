@@ -131,6 +131,40 @@ def tm_function(d, Nres):
     return 1 / (1 + (d / d0) ** 2)
 
 
+def compute_ipsae_score(src_mask, tgt_mask, pae, maski, mask_pad, cutoff=15.0):
+    pair_mask = (
+        maski[:, :, None]
+        * mask_pad[:, None, :]
+        * mask_pad[:, :, None]
+        * src_mask[:, :, None]
+        * tgt_mask[:, None, :]
+    )
+    # Check pae < cutoff
+    valid_pae = (pae < cutoff) * pair_mask
+
+    # n0 = count of valid tgt residues for each src residue
+    n0 = valid_pae.sum(dim=-1)  # (B, N)
+
+    # d0 calculation
+    d0_arg = torch.clamp(n0, min=19) - 15
+    d0 = 1.24 * torch.pow(d0_arg, 1 / 3) - 1.8
+    d0 = torch.clamp(d0, min=1.0)
+
+    # TM score term: 1 / (1 + (pae / d0.unsqueeze(-1)) ** 2)
+    term = 1.0 / (1.0 + (pae / d0.unsqueeze(-1)) ** 2)
+
+    # Sum valid terms
+    sum_term = (term * valid_pae).sum(dim=-1)
+
+    # Mean
+    ipsae_res = sum_term / (n0 + 1e-5)
+
+    # Zeros for invalid src residues
+    ipsae_res = ipsae_res * src_mask
+
+    return ipsae_res.max(dim=-1).values
+
+
 def compute_ptms(logits, x_preds, feats, multiplicity):
     # It needs to take as input the mask of the frames as they are not used to compute the PTM
     _, mask_collinear_pred = compute_frame_pred(
@@ -245,6 +279,22 @@ def compute_ptms(logits, x_preds, feats, multiplicity):
         dim=1,
     ).values
 
+    # iPTM between designed residues and any token from a different chain
+    design_residue_iptm_mask = (
+        maski[:, :, None]
+        * mask_pad[:, None, :]
+        * mask_pad[:, :, None]
+        * (asym_id[:, None, :] != asym_id[:, :, None])
+        * (
+            is_design_token[:, :, None] + is_design_token[:, None, :]
+        ).clamp(max=1)
+    )
+    design_residue_iptm = torch.max(
+        torch.sum(tm_expected_value * design_residue_iptm_mask, dim=-1)
+        / (torch.sum(design_residue_iptm_mask, dim=-1) + 1e-5),
+        dim=1,
+    ).values
+
     design_ptm_mask = (
         maski[:, :, None]
         * mask_pad[:, None, :]
@@ -325,6 +375,34 @@ def compute_ptms(logits, x_preds, feats, multiplicity):
         dim=1,
     ).values
 
+    # Compute ipSAE
+    # Compute expected PAE
+    # reuse probs and pae_value from earlier
+    pae_bins = pae_value.squeeze(0)
+    expected_pae = torch.sum(probs * pae_bins, dim=-1)  # (B, N, N)
+
+    design_to_target_ipsae = compute_ipsae_score(
+        is_chain_design_token, is_target_token, expected_pae, maski, mask_pad
+    )
+    target_to_design_ipsae = compute_ipsae_score(
+        is_target_token, is_chain_design_token, expected_pae, maski, mask_pad
+    )
+    design_ipsae_min = torch.min(design_to_target_ipsae, target_to_design_ipsae)
+
+    chain_pair_ipsae = {}
+    for idx1 in asym_ids_list:
+        pair_ipsae = {}
+        for idx2 in asym_ids_list:
+            if idx1 == idx2:
+                continue
+            mask_c1 = (asym_id == idx1).float()
+            mask_c2 = (asym_id == idx2).float()
+            score = compute_ipsae_score(
+                mask_c1, mask_c2, expected_pae, maski, mask_pad
+            )
+            pair_ipsae[idx2] = score
+        chain_pair_ipsae[idx1] = pair_ipsae
+
     return (
         ptm,
         iptm,
@@ -332,10 +410,15 @@ def compute_ptms(logits, x_preds, feats, multiplicity):
         protein_iptm,
         chain_pair_iptm,
         design_to_target_iptm,
+        design_residue_iptm,
         design_iptm,
         design_iiptm,
         target_ptm,
         design_ptm,
+        design_ipsae_min,
+        design_to_target_ipsae,
+        target_to_design_ipsae,
+        chain_pair_ipsae,
     )
 
 

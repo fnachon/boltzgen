@@ -1,4 +1,5 @@
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
+import warnings
 
 import torch
 from torch import Tensor, nn
@@ -36,6 +37,75 @@ def softmax_dropout(
     raise RuntimeError(
         "Softmax dropout failed to keep at least one edge for each node after 10 attempts."
     )
+
+
+def build_constraint_logit_mask(
+    num_nodes: int,
+    aa_constraint_mask: Optional[Tensor],
+    inverse_fold_restriction: list[str],
+    canonical_tokens: list[str],
+    inf: float,
+    device: torch.device,
+) -> Tensor:
+    """Build per-position inverse-folding logit mask.
+
+    The mask uses additive logit bias semantics:
+    0.0 = allowed, -inf = disallowed.
+    """
+    num_aa = len(canonical_tokens)
+    has_per_residue_constraints = False
+
+    if aa_constraint_mask is None:
+        per_residue_blocked = torch.zeros(
+            num_nodes, num_aa, dtype=torch.bool, device=device
+        )
+    else:
+        expected_shape = (num_nodes, num_aa)
+        if aa_constraint_mask.shape != expected_shape:
+            warnings.warn(
+                f"aa_constraint_mask shape mismatch: "
+                f"got {aa_constraint_mask.shape}, expected {expected_shape}. "
+                f"Ignoring per-residue constraints.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            per_residue_blocked = torch.zeros(
+                num_nodes, num_aa, dtype=torch.bool, device=device
+            )
+        else:
+            has_per_residue_constraints = True
+            per_residue_blocked = aa_constraint_mask.to(device=device) > 0
+
+    global_blocked = torch.zeros(num_aa, dtype=torch.bool, device=device)
+    for res_type in inverse_fold_restriction:
+        global_blocked[canonical_tokens.index(res_type)] = True
+
+    combined_blocked = per_residue_blocked | global_blocked.unsqueeze(0)
+    all_blocked = combined_blocked.all(dim=1)
+
+    if all_blocked.any() and has_per_residue_constraints:
+        blocked_positions = torch.where(all_blocked)[0].tolist()
+        warnings.warn(
+            f"Positions {blocked_positions} have all amino acids blocked by the "
+            f"combination of per-residue constraints and '--inverse_fold_avoid'. "
+            f"Relaxing per-residue constraints for these positions.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        per_residue_blocked = per_residue_blocked.clone()
+        per_residue_blocked[all_blocked] = False
+        combined_blocked = per_residue_blocked | global_blocked.unsqueeze(0)
+
+    still_all_blocked = combined_blocked.all(dim=1)
+    if still_all_blocked.any():
+        blocked_positions = torch.where(still_all_blocked)[0].tolist()
+        raise ValueError(
+            f"Inverse folding has no valid amino acids at token positions "
+            f"{blocked_positions} after applying '--inverse_fold_avoid'. "
+            f"Reduce global restrictions to keep at least one amino acid."
+        )
+
+    return combined_blocked.to(dtype=torch.float32) * (-inf)
 
 
 class MLPAttnGNN(nn.Module):
@@ -464,6 +534,7 @@ class InverseFoldingDecoder(nn.Module):
         num_decoder_layers: int = 3,
         inverse_fold_restriction: List[str] = [],
         sampling_temperature: float = 0.1,
+        tie_symmetric_sequences: bool = True,
         **kwargs, # old checkpoint compatibility
     ):
         super().__init__()
@@ -485,6 +556,7 @@ class InverseFoldingDecoder(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.inverse_fold_restriction = inverse_fold_restriction
         self.sampling_temperature = sampling_temperature
+        self.tie_symmetric_sequences = tie_symmetric_sequences
 
         self.decoder_layers = nn.ModuleList()
         self.inf = 10**6
@@ -506,6 +578,43 @@ class InverseFoldingDecoder(nn.Module):
         with torch.no_grad():
             # init the output of the predictor to be zero
             self.predictor.weight.zero_()
+
+    def _build_symmetric_groups(
+        self,
+        feats: Dict[str, Tensor],
+        valid_mask: Tensor,
+        design_mask: Tensor,
+    ) -> Tuple[Dict[int, List[int]], Dict[int, int]]:
+        """Build mapping from positions to symmetric groups for homomer tying."""
+        from collections import defaultdict
+
+        symmetric_group = feats["symmetric_group"][valid_mask]
+        res_idx = feats["feature_residue_index"][valid_mask]
+
+        # Group by (symmetric_group, res_idx) - positions that should share sequence
+        key_to_positions = defaultdict(list)
+
+        num_nodes = symmetric_group.shape[0]
+        for i in range(num_nodes):
+            if design_mask[i]:
+                group = symmetric_group[i].item()
+                if group > 0:  # 0 = no group
+                    key = (group, res_idx[i].item())
+                    key_to_positions[key].append(i)
+
+        # Build symmetric groups (only groups with >1 member)
+        sym_groups = {}
+        position_to_group = {}
+        group_id = 0
+
+        for positions in key_to_positions.values():
+            if len(positions) > 1:
+                sym_groups[group_id] = positions
+                for pos in positions:
+                    position_to_group[pos] = group_id
+                group_id += 1
+
+        return sym_groups, position_to_group
 
     def forward(self, s, z, edge_idx, valid_mask, feats):
         with torch.no_grad():
@@ -549,14 +658,17 @@ class InverseFoldingDecoder(nn.Module):
             f"num_design: {num_design}, num_not_design: {num_not_design}"
         )
 
-        # Create restriction mask that sets the probability of excluded residues to 0
-        if len(self.inverse_fold_restriction) > 0:
-            restriction_mask = torch.zeros(len(const.canonical_tokens), device=s.device)
-            for res_type in self.inverse_fold_restriction:
-                restriction_mask[const.canonical_tokens.index(res_type)] = -self.inf
-            restriction_mask = restriction_mask.unsqueeze(0)
-        else:
-            restriction_mask = torch.zeros(len(const.canonical_tokens), device=s.device)
+        constraint_mask = None
+        if "aa_constraint_mask" in feats:
+            constraint_mask = feats["aa_constraint_mask"][valid_mask]
+        per_residue_mask = build_constraint_logit_mask(
+            num_nodes=num_nodes,
+            aa_constraint_mask=constraint_mask,
+            inverse_fold_restriction=self.inverse_fold_restriction,
+            canonical_tokens=const.canonical_tokens,
+            inf=self.inf,
+            device=s.device,
+        )
 
         order = torch.randperm(num_nodes, device=s.device).cpu().numpy().tolist()
         # Non-design residues are not sampled and used as the condition. So the order should filter them out.
@@ -572,33 +684,64 @@ class InverseFoldingDecoder(nn.Module):
         else:
             decoded_seq = torch.zeros(num_nodes, const.num_tokens, device=s.device)
             logits = torch.zeros(num_nodes, const.num_tokens, device=s.device)
+
+        # Build symmetric groups for homomer tying
+        if self.tie_symmetric_sequences and "symmetric_group" in feats:
+            sym_groups, position_to_group = self._build_symmetric_groups(
+                feats, valid_mask, design_mask
+            )
+            sampled = set(torch.where(~design_mask)[0].cpu().numpy().tolist()) if num_not_design > 0 else set()
+        else:
+            sym_groups, position_to_group = {}, {}
+            sampled = set()
+
         src_idx, dst_idx = edge_idx[0], edge_idx[1]
 
         # decoding in order
         for i in order:
-            s_i = s[i : i + 1]
-            edge_mask_i = dst_idx == i
-            z_i = z[edge_mask_i]
-            src_idx_i = src_idx[edge_mask_i]
-            res_type = decoded_seq[src_idx_i]
-            res_rep = self.seq_to_s(res_type)
-            neighbors_rep_i = torch.concat([z_i, s[src_idx_i] + res_rep], dim=-1)
+            # Skip if already sampled (symmetric position was processed earlier)
+            if self.tie_symmetric_sequences and i in sampled:
+                continue
 
-            for layer in self.decoder_layers:
-                s_i = layer.sample(s_i, neighbors_rep_i)
+            # Get symmetric positions (or just [i] if no symmetry)
+            if self.tie_symmetric_sequences and i in position_to_group:
+                positions = sym_groups[position_to_group[i]]
+            else:
+                positions = [i]
 
-            logits_i = self.predictor(s_i)
-            logits[i] = logits_i
+            # Aggregate logits from all symmetric positions
+            aggregated_logits = None
+            for pos in positions:
+                s_pos = s[pos : pos + 1]
+                edge_mask_pos = dst_idx == pos
+                z_pos = z[edge_mask_pos]
+                src_idx_pos = src_idx[edge_mask_pos]
+                res_type_pos = decoded_seq[src_idx_pos]
+                res_rep = self.seq_to_s(res_type_pos)
+                neighbors_rep_pos = torch.concat([z_pos, s[src_idx_pos] + res_rep], dim=-1)
 
+                s_temp = s_pos
+                for layer in self.decoder_layers:
+                    s_temp = layer.sample(s_temp, neighbors_rep_pos)
+
+                logits_pos = self.predictor(s_temp)
+                if aggregated_logits is None:
+                    aggregated_logits = logits_pos
+                else:
+                    aggregated_logits = aggregated_logits + logits_pos
+
+            # Average logits across symmetric positions
+            aggregated_logits = aggregated_logits / len(positions)
+
+            # Sample from aggregated logits
             pred_canonical = (
-                logits_i[
+                aggregated_logits[
                     :,
                     const.canonicals_offset : len(const.canonical_tokens)
                     + const.canonicals_offset,
                 ]
-                + restriction_mask
+                + per_residue_mask[i : i + 1]  # Position-specific mask
             )
-            ids_canonical = torch.argmax(pred_canonical, dim=-1)
             if self.sampling_temperature is None:
                 ids_canonical = torch.argmax(pred_canonical, dim=-1)
             else:
@@ -609,7 +752,13 @@ class InverseFoldingDecoder(nn.Module):
 
             ids = ids_canonical + const.canonicals_offset
             pred_one_hot = F.one_hot(ids, num_classes=const.num_tokens)
-            decoded_seq[i] = pred_one_hot
+
+            # Apply same residue to all symmetric positions
+            for pos in positions:
+                decoded_seq[pos] = pred_one_hot
+                logits[pos] = aggregated_logits
+                if self.tie_symmetric_sequences:
+                    sampled.add(pos)
 
         n_tokens = valid_mask.shape[1]
         res_type = torch.zeros(1, n_tokens, self.num_res_type, device=s.device)

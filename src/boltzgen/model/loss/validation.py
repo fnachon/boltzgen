@@ -1706,7 +1706,7 @@ def weighted_minimum_rmsd(
                 atom_coords,
                 pred_atom_coords,
                 atom_mask,
-                target_mask,
+                align_weights,
                 atom_mask,
                 multiplicity,
                 rmsd_mask=design_mask,

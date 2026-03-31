@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "boltzgen"
 requires-python = ">=3.11"
-version = "0.2.0"
+version = "0.3.1"
 readme = { file = "PYPI_DESCRIPTION.md", content-type = "text/markdown" }
 description = "Protein design"
 dependencies = [
@@ -21,7 +21,7 @@ dependencies = [
     "biotite",
     "pydssp",
     "logomaker",
-    "gemmi==0.6.5",
+    "gemmi>=0.6.5",  # Supports both 0.6.x and 0.7.x (see mmcif.py for compatibility layer)
     "torch>=2.4.1",
     "scikit-learn",
     "hydra-core",

@@ -88,6 +88,9 @@ class BoltzMasker(Module):
                 new["disto_target"] = clone["disto_target"]
             new["token_pair_mask"] = clone["token_pair_mask"]
             new["binding_type"] = clone["binding_type"]
+            # Per-residue amino acid constraints for inverse folding
+            if "aa_constraint_mask" in clone:
+                new["aa_constraint_mask"] = clone["aa_constraint_mask"]
             new["structure_group"] = clone["structure_group"]
             new["cyclic"] = clone["cyclic"]
             new["modified"] = clone["modified"]
@@ -101,6 +104,7 @@ class BoltzMasker(Module):
             new["res_type_clone"] = clone["res_type_clone"]
             new["feature_residue_index"] = clone["feature_residue_index"]
             new["feature_asym_id"] = clone["feature_asym_id"]
+            new["symmetric_group"] = clone["symmetric_group"]
             new["token_to_res"] = clone["token_to_res"]
             new["token_bonds"] = torch.zeros_like(
                 clone["token_bonds"]

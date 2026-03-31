@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import random
 import re
+import warnings
 from typing import Dict, List, Optional
 from collections import defaultdict
 from rdkit.Chem import Mol
@@ -198,6 +199,7 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
         return_native: bool = False,
         reference_metadata_dir: Optional[Path] = None,
         target_templates: bool = False,
+        design_mask_templates: bool = False,
         compute_affinity: bool = False,
         design: bool = False,
         backbone_only: bool = False,
@@ -232,6 +234,7 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
         self.return_native = return_native
         self.reference_metadata_dir = reference_metadata_dir
         self.target_templates = target_templates
+        self.design_mask_templates = design_mask_templates
         self.compute_affinity = compute_affinity
         self.design = design
         self.backbone_only = backbone_only
@@ -317,8 +320,28 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
         if "binding_type" in metadata:
             binding_type = metadata["binding_type"]
 
+        # Per-residue amino acid constraints for inverse folding
+        aa_constraint_mask = None
+        if "aa_constraint_mask" in metadata:
+            loaded_mask = metadata["aa_constraint_mask"]
+            # Validate the loaded mask is a proper array with expected shape
+            if (
+                isinstance(loaded_mask, np.ndarray)
+                and loaded_mask.ndim == 2
+                and loaded_mask.shape[1] == 20  # 20 canonical amino acids
+            ):
+                aa_constraint_mask = loaded_mask
+            else:
+                warnings.warn(
+                    f"Invalid aa_constraint_mask in NPZ: "
+                    f"type={type(loaded_mask)}, shape={getattr(loaded_mask, 'shape', 'N/A')}. "
+                    f"Expected ndarray with shape (N, 20). Ignoring constraints.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         # Get features
-        feat = self.get_feat(generated_path, design_mask, ss_type, binding_type)
+        feat = self.get_feat(generated_path, design_mask, ss_type, binding_type, aa_constraint_mask)
 
         # Get native features
         if self.return_native:
@@ -332,7 +355,7 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
 
         return feat
 
-    def get_feat(self, path, design_mask, ss_type=None, binding_type=None):
+    def get_feat(self, path, design_mask, ss_type=None, binding_type=None, aa_constraint_mask=None):
         # Load design
         if self.extra_mol_dir is not None:
             mols = {
@@ -460,6 +483,9 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
             features["ss_type"] = torch.from_numpy(ss_type).long()
         if binding_type is not None:
             features["binding_type"] = torch.from_numpy(binding_type).long()
+        # Per-residue amino acid constraints for inverse folding
+        if aa_constraint_mask is not None:
+            features["aa_constraint_mask"] = torch.from_numpy(aa_constraint_mask).float()
 
         # If we do not want the design mask to impact the featurizer (e.g. represent atoms as atom14), we set the design mask only here.
         if not self.design:
@@ -490,7 +516,10 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
 
         # Set templates
         if self.target_templates:
-            template_mask = ~features["chain_design_mask"].numpy()
+            if self.design_mask_templates:
+                template_mask = ~features["design_mask"].numpy()
+            else:
+                template_mask = ~features["chain_design_mask"].numpy()
             templates_features = template_from_tokens(tokenized, template_mask)
         else:
             # Compute template features
@@ -525,6 +554,7 @@ class FromGeneratedDataModule(pl.LightningDataModule):
         return_native: bool = False,
         compute_affinity: bool = False,
         target_templates: bool = False,
+        design_mask_templates: bool = False,
         skip_existing: bool = False,
         skip_existing_kind: str = None,
         legacy_gen_suffix: str = "_gen.cif",
@@ -552,6 +582,7 @@ class FromGeneratedDataModule(pl.LightningDataModule):
         self.legacy_metadata_suffix = legacy_metadata_suffix
         self.compute_affinity = compute_affinity
         self.target_templates = target_templates
+        self.design_mask_templates = design_mask_templates
         self.extra_features = extra_features
         self.disulfide_prob = cfg.disulfide_prob
         self.disulfide_on = cfg.disulfide_on
@@ -583,6 +614,7 @@ class FromGeneratedDataModule(pl.LightningDataModule):
                 return_native=self.return_native,
                 reference_metadata_dir=self.reference_metadata_dir,
                 target_templates=self.target_templates,
+                design_mask_templates=self.design_mask_templates,
                 compute_affinity=self.compute_affinity,
                 design=self.cfg.design,
                 backbone_only=self.cfg.backbone_only,
@@ -790,6 +822,7 @@ class FromGeneratedDataModule(pl.LightningDataModule):
             return_native=self.return_native,
             reference_metadata_dir=self.reference_metadata_dir,
             target_templates=self.target_templates,
+            design_mask_templates=self.design_mask_templates,
             compute_affinity=self.compute_affinity,
             design=self.cfg.design,
             backbone_only=self.cfg.backbone_only,
