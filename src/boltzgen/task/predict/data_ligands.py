@@ -221,15 +221,14 @@ class PredictionDataset(torch.utils.data.Dataset):
         try:
             # Try to find molecules in the dataset moldir if provided
             # Find missing ones in global moldir and check if all found
+            # Note: load fresh from moldir to avoid losing RDKit atom properties
+            # when self.canonicals is pickled by DataLoader worker processes.
             molecules = {}
-            molecules.update(self.canonicals)
             mol_names = set(tokenized.tokens["res_name"].tolist())
-            mol_names = mol_names - set(self.canonicals.keys())
             if self.moldir is not None:
                 molecules.update(load_molecules(self.moldir, mol_names))
-
-            mol_names = mol_names - set(molecules.keys())
-            molecules.update(load_molecules(self.moldir, mol_names))
+            else:
+                molecules.update({k: v for k, v in self.canonicals.items() if k in mol_names})
         except Exception as e:  # noqa: BLE001
             print(f"Molecule loading failed for {target_id} with error {e}. Skipping.")
             return self.__getitem__(0)
