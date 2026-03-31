@@ -841,11 +841,13 @@ class FromGeneratedDataModule(pl.LightningDataModule):
         )
 
     def predict_dataloader(self) -> DataLoader:
+        pin_memory = self.cfg.pin_memory and not torch.backends.mps.is_available()
         return DataLoader(
             self.predict_set,
             batch_size=self.cfg.batch_size,
             num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory,
+            pin_memory=pin_memory,
+            persistent_workers=self.cfg.num_workers > 0,
             shuffle=False,
             collate_fn=collate,
         )

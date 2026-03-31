@@ -529,11 +529,13 @@ class ProteinBinderDataModule(pl.LightningDataModule):
             The training dataloader.
 
         """
+        pin_memory = self.pin_memory and not torch.backends.mps.is_available()
         return DataLoader(
             self.predict_set,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
+            pin_memory=pin_memory,
+            persistent_workers=self.num_workers > 0,
             shuffle=False,
             collate_fn=collate,
         )
