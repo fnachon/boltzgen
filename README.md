@@ -106,9 +106,7 @@ docker build -t boltzgen:weights --build-arg DOWNLOAD_WEIGHTS=true .
 
 `boltzgen run` takes a [design specification](#how-to-make-a-design-specification-yaml) `.yaml` and produces a set of ranked designs.\
 ⚠️ it downloads models (~6GB) to `~/.cache`. This can by changed by passing `--cache YOUR_PATH` or by setting `$HF_HOME`.\
-⚠️ If your run is ever interrupted, you can restart it with `--reuse`. No progress is lost.\
-⚠️ On MacOS set `--num_workers 0` to prevent MPS-related incompatibilities and runtime errors. Optionnaly, to suppress MPS warnings about unsupported pinned memory, set  `--config <step> data.pin_memory=false` for the following steps: `design`, `inverse_folding`, `folding`, and `design_folding` 
-
+⚠️ If your run is ever interrupted, you can restart it with `--reuse`. No progress is lost.
 
 ```bash
 boltzgen run example/vanilla_protein/1g13prot.yaml \
