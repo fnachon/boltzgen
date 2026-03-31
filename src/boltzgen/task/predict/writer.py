@@ -416,7 +416,7 @@ class DesignWriter(BasePredictionWriter):
                     traj = trajs[n]
                     aligned = [traj[0]]
                     for frame in traj[1:]:
-                        with torch.autocast("cuda", enabled=False):
+                        with torch.autocast(device_type=frame.device.type, enabled=False):
                             aligned.append(
                                 weighted_rigid_align(
                                     frame.float().unsqueeze(0),
@@ -464,7 +464,7 @@ class DesignWriter(BasePredictionWriter):
                     traj = trajs[n]
                     aligned = [traj[0]]
                     for frame in traj[1:]:
-                        with torch.autocast("cuda", enabled=False):
+                        with torch.autocast(device_type=frame.device.type, enabled=False):
                             aligned.append(
                                 weighted_rigid_align(
                                     frame.float().unsqueeze(0),
