@@ -30,6 +30,7 @@ quiet_startup()
 
 import collections
 import huggingface_hub
+import huggingface_hub.constants
 import argparse
 from dataclasses import dataclass
 import shlex
@@ -37,6 +38,7 @@ import subprocess
 import os
 import time
 import math
+import pickle  # noqa: E402
 import re
 import shutil
 import sys
@@ -48,6 +50,7 @@ import yaml
 import hydra
 import omegaconf
 import torch
+from rdkit import Chem  # noqa: E402
 
 from boltzgen.data import const
 from boltzgen.data.mol import load_canonicals
@@ -72,6 +75,7 @@ step_names = [
     "design_folding",
     "folding",
     "affinity",
+    "esmfold2_scoring",
     "analysis",
     "filtering",
 ]
@@ -93,21 +97,31 @@ protocol_configs = {
         "filtering": ["use_affinity=true"],
     },
     "nanobody-anything": {
-        "analysis": ["largest_hydrophobic=false", "largest_hydrophobic_refolded=false"],
-        "filtering": ["filter_cysteine=true"],
+        "analysis": [
+            "largest_hydrophobic=false",
+            "largest_hydrophobic_refolded=false",
+            "liability_modality=antibody",
+        ],
+        "filtering": ["filter_cysteine=true", "modality=antibody"],
     },
     "antibody-anything": {
-        "analysis": ["largest_hydrophobic=false", "largest_hydrophobic_refolded=false"],
-        "filtering": ["filter_cysteine=true"],
+        "analysis": [
+            "largest_hydrophobic=false",
+            "largest_hydrophobic_refolded=false",
+            "liability_modality=antibody",
+        ],
+        "filtering": ["filter_cysteine=true", "modality=antibody"],
     },
     "protein-redesign": {
+        "esmfold2_scoring": ["scoring_mode=redesign"],
         # For redesigning/optimizing existing proteins (e.g., symmetric dimers)
         # where all chains may have designed residues. Skips design_folding and
         # uses design_mask (not chain_design_mask) for target/template definition.
         "folding": ["data.design_mask_templates=true"],
         "analysis": ["use_design_mask_for_target=true"],
         "filtering": [
-            "metrics_override={design_to_target_iptm: null, neg_min_design_to_target_pae: null, design_ptm: null, plip_hbonds_refolded: null, plip_saltbridge_refolded: null, delta_sasa_refolded: null, plip_hbonds: null, plip_saltbridge: null, delta_sasa_original: null, design_residue_iptm: 1, iptm: 2, ptm: 3, neg_filter_rmsd_design: 4}",
+            "esmfold2_redesign=true",
+            "metrics_override={design_ptm: null, plip_hbonds_refolded: null, plip_saltbridge_refolded: null, delta_sasa_refolded: null, plip_hbonds: null, plip_saltbridge: null, delta_sasa_original: null, esmfold2_score: 1, neg_filter_rmsd_design: 4}",
         ],
     },
 }
@@ -130,6 +144,10 @@ ARTIFACTS: dict[str, tuple[str, str]] = {
         "huggingface:boltzgen/boltzgen-1:boltzgen1_ifold.ckpt",
         "model",
     ),
+    "solublempnn": (
+        "https://files.ipd.uw.edu/pub/ligandmpnn/solublempnn_v_48_020.pt",
+        "model",
+    ),
     "folding": (
         "huggingface:boltzgen/boltzgen-1:boltz2_conf_final.ckpt",
         "model",
@@ -137,6 +155,9 @@ ARTIFACTS: dict[str, tuple[str, str]] = {
     "affinity": ("huggingface:boltzgen/boltzgen-1:boltz2_aff.ckpt", "model"),
     "moldir": ("huggingface:boltzgen/inference-data:mols.zip", "dataset"),
 }
+
+
+SOLUBLEMPNN_SHA256 = "7af52d090172c230c7f0e9d21e02203f6b3a38b16db58d3c7a3960e0a9a6e31a"
 
 
 ### CLI arguments ###
@@ -264,8 +285,26 @@ def add_configure_arguments(
     p.add_argument(
         "--inverse_fold_checkpoint",
         type=str,
-        help="Path or huggingface repo and filename for the inverse fold checkpoint. Default: %(default)s",
+        help="BoltzIF checkpoint, used for protein-small_molecule or with --inverse_fold_model boltzif. Default: %(default)s",
         default=ARTIFACTS["inverse-fold"][0],
+    )
+    p.add_argument(
+        "--inverse_fold_model",
+        choices=["boltzif", "solublempnn"],
+        default=None,
+        help="Inverse-folding model. Default: boltzif for protein-small_molecule, "
+        "solublempnn otherwise. protein-small_molecule requires boltzif.",
+    )
+    p.add_argument(
+        "--solublempnn_checkpoint",
+        default=ARTIFACTS["solublempnn"][0],
+        help="SolubleMPNN checkpoint (local path or Hugging Face artifact). By default, downloads and caches the upstream v_48_020 weights.",
+    )
+    p.add_argument(
+        "--solublempnn_sampling_temperature",
+        type=float,
+        default=0.1,
+        help="Positive SolubleMPNN sampling temperature. Default: %(default)s",
     )
     p.add_argument(
         "--inverse_fold_avoid",
@@ -283,6 +322,17 @@ def add_configure_arguments(
 
     # Folding and affinity prediction configuration options
     p = parser.add_argument_group("folding and affinity prediction")
+    p.add_argument(
+        "--esmfold2_python",
+        default=os.environ.get("BOLTZGEN_ESMFOLD2_PYTHON"),
+        help="Optional ESMFold2 interpreter override. By default BoltzGen prepares its runtime automatically.",
+    )
+    p.add_argument(
+        "--esmfold2_acceleration",
+        choices=["auto", "fused", "off"],
+        default="auto",
+        help="ESMFold2 acceleration: auto preserves native numerics; fused also enables native BF16 kernels; off disables acceleration.",
+    )
     p.add_argument(
         "--folding_checkpoint",
         type=str,
@@ -365,7 +415,8 @@ def add_models_download_options(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--cache",
         type=Path,
-        help="Directory where downloaded models will be stored. Default: ~/.cache",
+        help="Directory for Boltz models and data. Default: ~/.cache. "
+        "ESM checkpoints use HF_HOME/HF_HUB_CACHE; the ESM runtime uses UV_CACHE_DIR.",
         default=None,
     )
 
@@ -531,12 +582,14 @@ def build_parser() -> argparse.ArgumentParser:
         prog="boltzgen",
         description="Boltzgen command line interface",
     )
+
     # Support: boltzgen -v / --version
     def get_package_version() -> str:
         try:
             return pkg_version("boltzgen")
         except PackageNotFoundError:
             return "unknown"
+
     parser.add_argument(
         "-v",
         "--version",
@@ -578,7 +631,7 @@ def run_command(args: argparse.Namespace) -> None:
 
 def download_command(args: argparse.Namespace) -> list[Path]:
     """
-    Download **BoltzGen model checkpoints and the molecules directory** (hosted on HuggingFace).
+    Download model checkpoints and molecule data from their configured sources.
 
     Parameters
     ----------
@@ -612,6 +665,45 @@ def download_command(args: argparse.Namespace) -> list[Path]:
     return download_paths
 
 
+def _resolve_inverse_fold_model(args: argparse.Namespace) -> str:
+    """Validate inverse-fold settings before loading any pipeline artifacts."""
+    if args.only_inverse_fold and args.skip_inverse_folding:
+        raise ValueError(
+            "--only_inverse_fold cannot be combined with --skip_inverse_folding"
+        )
+    protocol = args.protocol
+    if protocol not in protocol_configs:
+        raise ValueError(
+            f"Invalid protocol: {protocol}. Valid protocols: {list(protocol_configs.keys())}"
+        )
+
+    inverse_fold_model = args.inverse_fold_model or (
+        "boltzif" if protocol == "protein-small_molecule" else "solublempnn"
+    )
+    if protocol == "protein-small_molecule" and inverse_fold_model != "boltzif":
+        raise ValueError(
+            "protein-small_molecule requires BoltzIF because SolubleMPNN does "
+            "not condition on the ligand. Remove --inverse_fold_model solublempnn "
+            "or select --inverse_fold_model boltzif."
+        )
+    use_solublempnn = inverse_fold_model == "solublempnn"
+    if use_solublempnn and (args.only_inverse_fold or not args.skip_inverse_folding):
+        temperature = args.solublempnn_sampling_temperature
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError(
+                "SolubleMPNN sampling temperature must be finite and positive"
+            )
+        canonical_letters = {
+            const.prot_token_to_letter[residue] for residue in const.canonical_tokens
+        }
+        if not set(args.inverse_fold_avoid or "") < canonical_letters:
+            raise ValueError(
+                "SolubleMPNN --inverse_fold_avoid must use canonical amino-acid "
+                "letters and leave at least one amino acid allowed"
+            )
+    return inverse_fold_model
+
+
 def configure_command(args: argparse.Namespace) -> None:
     """
     Generate **resolved per-step YAML configuration files** for the binder-design pipeline.
@@ -624,12 +716,14 @@ def configure_command(args: argparse.Namespace) -> None:
     * `<output_dir>/config/<step>.yaml` — fully resolved config for each pipeline step.
     * `<output_dir>/steps.yaml` — manifest of steps and config file paths.
 
-    This stage does **not execute** any model code; it only prepares the YAMLs used by
-    `execute_command(...)`.
+    This stage prepares the YAMLs used by `execute_command(...)`. Fresh polymer
+    runs also prepare the isolated ESM runtime and check CUDA availability;
+    they do not load model weights or run inference here.
 
     Usually this is executed by `boltzgen run ...` but it can be used like:
         $ boltzgen configure path/to/design.yaml --output out_dir --protocol peptide-anything
     """
+    _resolve_inverse_fold_model(args)
     moldir = get_artifact_path(args, args.moldir, repo_type="dataset")
     mols = load_canonicals(moldir=moldir)
 
@@ -653,6 +747,20 @@ def configure_command(args: argparse.Namespace) -> None:
     # Check that tasks can be instantiated
     for step in pipeline.steps:
         step.check()
+        if step.name == "esmfold2_scoring":
+            from boltzgen.task.esmfold2.contract import validate_scoring_mode, validate_acceleration
+            from boltzgen.task.esmfold2.runtime import resolve_python
+
+            esm_config = step.get_config()
+            validate_scoring_mode(
+                esm_config.get("scoring_mode", "binder"),
+                esm_config.get("scoring_target_chains"),
+            )
+            validate_acceleration(esm_config.get("acceleration", "auto"))
+            # Reuse can finish entirely from saved scores. Provision that run's
+            # runtime only if the scoring task finds work still to compute.
+            if not esm_config.reuse:
+                resolve_python(esm_config.python, require_cuda=True)
 
     # Make the config subdir in output
     config_dir = output_dir / "config"
@@ -912,10 +1020,7 @@ class BinderDesignPipeline:
 
     def __init__(self, args: argparse.Namespace, moldir: Path):
         protocol = args.protocol
-        if protocol not in protocol_configs:
-            raise ValueError(
-                f"Invalid protocol: {protocol}. Valid protocols: {list(protocol_configs.keys())}"
-            )
+        use_solublempnn = _resolve_inverse_fold_model(args) == "solublempnn"
 
         # Handle use_kernels argument, defaulting to (0,0) for CPU/MPS
         device_capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
@@ -990,27 +1095,37 @@ class BinderDesignPipeline:
                 f"override.noise_scale_schedule=null"
             )
 
-        if args.only_inverse_fold:
-            exclude_residues = []
+        inverse_fold_model_args = []
+        if args.only_inverse_fold or not args.skip_inverse_folding:
             inverse_fold_avoid = (
                 args.inverse_fold_avoid
                 if args.inverse_fold_avoid is not None
                 else (
                     "C"
                     if protocol
-                    in [
-                        "peptide-anything",
-                        "nanobody-anything",
-                        "antibody-anything",
-                    ]
+                    in ["peptide-anything", "nanobody-anything", "antibody-anything"]
                     else ""
                 )
             )
+            exclude_residues = [
+                const.prot_letter_to_token[letter] for letter in inverse_fold_avoid
+            ]
+            restriction = f"[{', '.join(exclude_residues)}]"
+            if use_solublempnn:
+                inverse_fold_model_args = [
+                    f"checkpoint={get_artifact_path(args, args.solublempnn_checkpoint)}",
+                    f"sampling_temperature={args.solublempnn_sampling_temperature}",
+                    f"inverse_fold_restriction={restriction}",
+                ]
+            else:
+                inverse_fold_model_args = [
+                    f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
+                    f"override.use_kernels={use_kernels}",
+                    f"override.inverse_fold_args.inverse_fold_restriction={restriction}",
+                ]
 
-            for one_letter_code in inverse_fold_avoid:
-                exclude_residues.append(const.prot_letter_to_token[one_letter_code])
-
-            if len(exclude_residues) > 0:
+        if args.only_inverse_fold:
+            if exclude_residues:
                 print(
                     f"Inverse fold will avoid the following residues: {exclude_residues}"
                 )
@@ -1019,19 +1134,23 @@ class BinderDesignPipeline:
             self.steps.append(
                 PipelineStep(
                     name="inverse_folding",
-                    config_path=args.config_dir / "inverse_fold_only.yaml",
+                    config_path=args.config_dir
+                    / (
+                        "inverse_fold_only_solublempnn.yaml"
+                        if use_solublempnn
+                        else "inverse_fold_only.yaml"
+                    ),
                     args=[
                         f"output={output_dir}",
                         f"data.cfg.yaml_path=[{', '.join(str(s) for s in args.design_spec)}]",
                         f"trainer.devices={devices}",
                         f"data.cfg.multiplicity={getattr(args, 'inverse_fold_num_sequences', 10)}",
+                        f"data.cfg.moldir={moldir}",
+                        f"data.num_workers={args.num_workers}",
                         f"data.cfg.skip_existing={args.reuse}",
                         f"data.cfg.output_dir={output_dir}",
-                        f"override.use_kernels={use_kernels}",
-                        f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
-                        f"data.cfg.moldir={moldir}",
-                        f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
                     ]
+                    + inverse_fold_model_args
                     + config_args_by_step.get("inverse_folding", []),
                 )
             )
@@ -1060,20 +1179,6 @@ class BinderDesignPipeline:
 
             # Inverse folding of diffusion-generated backbones.
             if not args.skip_inverse_folding:
-                exclude_residues = []
-                inverse_fold_avoid = (
-                    args.inverse_fold_avoid
-                    if args.inverse_fold_avoid is not None
-                    else (
-                        "C"
-                        if protocol in ["peptide-anything", "nanobody-anything", "antibody-anything"]
-                        else ""
-                    )
-                )
-
-                for one_letter_code in inverse_fold_avoid:
-                    exclude_residues.append(const.prot_letter_to_token[one_letter_code])
-
                 if len(exclude_residues) > 0:
                     print(
                         f"Inverse fold will avoid the following residues: {exclude_residues}"
@@ -1085,7 +1190,12 @@ class BinderDesignPipeline:
                 self.steps.append(
                     PipelineStep(
                         name="inverse_folding",
-                        config_path=args.config_dir / "inverse_fold.yaml",
+                        config_path=args.config_dir
+                        / (
+                            "inverse_fold_solublempnn.yaml"
+                            if use_solublempnn
+                            else "inverse_fold.yaml"
+                        ),
                         args=[
                             f"output={output_dir}",
                             f"data.design_dir={input_dir}",
@@ -1093,12 +1203,10 @@ class BinderDesignPipeline:
                             f"data.cfg.num_workers={args.num_workers}",
                             f"data.skip_existing={args.reuse}",
                             f"data.skip_existing_kind=inverse_fold",
-                            f"override.use_kernels={use_kernels}",
-                            f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
                             f"data.cfg.moldir={moldir}",
                             f"trainer.devices={devices}",
-                            f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
                         ]
+                        + inverse_fold_model_args
                         + config_args_by_step["inverse_folding"],
                     )
                 )
@@ -1172,14 +1280,32 @@ class BinderDesignPipeline:
             )
 
         # Analysis
+        if not use_affinity:
+            self.steps.append(
+                PipelineStep(
+                    name="esmfold2_scoring",
+                    config_path=args.config_dir / "esmfold2.yaml",
+                    args=[
+                        f"design_dir={input_dir}",
+                        f"data.cfg.moldir={moldir}",
+                        f"python={args.esmfold2_python or 'null'}",
+                        f"acceleration='{args.esmfold2_acceleration}'",
+                        f"devices={devices}",
+                        f"reuse={args.reuse}",
+                    ]
+                    + config_args_by_step["esmfold2_scoring"],
+                )
+            )
+
         self.steps.append(
             PipelineStep(
                 name="analysis",
                 config_path=args.config_dir / "analysis.yaml",
                 args=[
                     f"design_dir={input_dir}",
-                    f"data.skip_existing={args.reuse}",
+                    f"data.skip_existing={args.reuse and use_affinity}",
                     f"data.skip_existing_kind=analyzed",
+                    f"esmfold2_metrics={not use_affinity}",
                     f"data.cfg.moldir={moldir}",
                     f"designfolding_metrics={do_design_folding}",
                     f"delta_sasa_original={args.skip_inverse_folding}",
@@ -1244,6 +1370,13 @@ class BinderDesignPipeline:
 
 ### Misc utiltiies ###
 def check_design_specs(args: argparse.Namespace, moldir: Path, mols: Dict[str, Any]):
+    stem_counts = collections.Counter(Path(path).stem for path in args.design_spec)
+    duplicates = sorted(stem for stem, count in stem_counts.items() if count > 1)
+    if duplicates:
+        raise ValueError(
+            "Design input filenames must have unique stems; repeated: "
+            + ", ".join(duplicates)
+        )
     last_banner = ""
     for design_spec in args.design_spec:
         banner = f"************** Checking design spec: {design_spec} **************"
@@ -1360,8 +1493,20 @@ def check_design_spec(
 def get_artifact_path(
     args, artifact: str, repo_type: str = "model", verbose: bool = True
 ) -> Path:
-    """Get the local path to an artifact that is either a local file or hosted on Hugging Face."""
-    if artifact.startswith("huggingface:"):
+    """Resolve a local file, Hugging Face artifact, or the upstream SolubleMPNN weights."""
+    if artifact == ARTIFACTS["solublempnn"][0]:
+        cache = (
+            Path(args.cache)
+            if args.cache is not None
+            else Path(huggingface_hub.constants.HF_HUB_CACHE)
+        )
+        result = cache / "boltzgen" / "solublempnn_v_48_020.pt"
+        if args.force_download or not result.exists():
+            result.parent.mkdir(parents=True, exist_ok=True)
+            torch.hub.download_url_to_file(
+                artifact, str(result), hash_prefix=SOLUBLEMPNN_SHA256
+            )
+    elif artifact.startswith("huggingface:"):
         try:
             _, repo_id, filename = artifact.split(":")
         except ValueError:
@@ -1389,7 +1534,9 @@ def get_artifact_path(
 
 def parse_config_args(base_config, config_args, valid_step_names):
     config_args_by_step = collections.defaultdict(list)
-    config_args_by_step.update(base_config)
+    config_args_by_step.update(
+        {step: list(values) for step, values in base_config.items()}
+    )
     if config_args:
         for config in config_args:
             if len(config) < 2:
@@ -1528,6 +1675,7 @@ def merge_command(args: argparse.Namespace) -> None:
         metrics_frames: list[pd.DataFrame] = []
         seq_frames: list[pd.DataFrame] = []
         per_target_frames: list[pd.DataFrame] = []
+        molecule_sources: dict[str, Path] = {}
         merged_count = 0
 
         for root in sources:
@@ -1540,42 +1688,72 @@ def merge_command(args: argparse.Namespace) -> None:
 
             metrics_path = src_dir / "aggregate_metrics_analyze.csv"
             if metrics_path.exists():
-                df = pd.read_csv(metrics_path)
-                if not df.empty:
-                    updated_rows = []
-                    for _, row in df.iterrows():
-                        if "id" not in row or "file_name" not in row:
-                            raise ValueError(
-                                "aggregate_metrics_analyze.csv must contain 'id' and 'file_name' columns."
-                            )
-                        original_id = str(row["id"])
-                        original_file = str(row["file_name"])
-                        key = (root, original_id)
-                        new_id = id_map.setdefault(key, f"{run_tag}_{original_id}")
-                        new_file = _make_new_file_name(original_file, new_id)
-                        updated_rows.append(
-                            {**row, "id": new_id, "file_name": new_file}
-                        )
-                        source_mappings.append(
-                            (original_id, new_id, original_file, new_file)
-                        )
-                    metrics_frames.append(pd.DataFrame(updated_rows))
-                    merged_count += len(source_mappings)
-            else:
-                # No metrics file: take the designs present in this directory. IDs
-                # from other directories cannot be reused, since with
-                # inverse_fold_num_sequences > 1 the inverse-folded designs are named
-                # design_i_j while the backbones here are named design_i.
-                original_ids = sorted(
-                    path.stem
-                    for path in src_dir.glob("*.cif")
-                    if not path.stem.endswith("_native")
+                # Preserve identifiers and valid "NA" sequences when merging.
+                sequence_columns = [
+                    column
+                    for column in pd.read_csv(metrics_path, nrows=0).columns
+                    if column == "designed_chain_sequence"
+                    or column.startswith(("designed_sequence", "full_sequence_"))
+                ]
+                df = pd.read_csv(
+                    metrics_path,
+                    converters={
+                        "id": str,
+                        "file_name": str,
+                        **dict.fromkeys(
+                            sequence_columns, lambda value: value or None
+                        ),
+                    },
                 )
-                for original_id in original_ids:
+                if df.empty:
+                    message = (
+                        f"Metrics file contains no analyzed designs: {metrics_path}. "
+                        "Rerun analysis before merging this source."
+                    )
+                    raise ValueError(message)
+                updated_rows = []
+                for _, row in df.iterrows():
+                    if "id" not in row or "file_name" not in row:
+                        raise ValueError(
+                            "aggregate_metrics_analyze.csv must contain 'id' and 'file_name' columns."
+                        )
+                    original_id = str(row["id"])
+                    original_file = str(row["file_name"])
+                    key = (root, original_id)
+                    new_id = id_map.setdefault(key, f"{run_tag}_{original_id}")
+                    new_file = _make_new_file_name(original_file, new_id)
+                    if pd.notna(row.get("esmfold2_input_hash")):
+                        from boltzgen.task.esmfold2.contract import (
+                            SCORE_DIR,
+                            copy_renamed_result,
+                        )
+
+                        row["esmfold2_input_hash"] = copy_renamed_result(
+                            src_dir / SCORE_DIR,
+                            dest_dir / SCORE_DIR,
+                            original_id,
+                            new_id,
+                            src_dir / original_file,
+                        )
+                    updated_rows.append(
+                        {**row, "id": new_id, "file_name": new_file}
+                    )
+                    source_mappings.append(
+                        (original_id, new_id, original_file, new_file)
+                    )
+                metrics_frames.append(pd.DataFrame(updated_rows))
+                merged_count += len(source_mappings)
+            else:
+                # Backbones and inverse-folded sequences have different IDs
+                # when several sequences are generated per backbone.
+                for path in sorted(src_dir.glob("*.cif")):
+                    if not path.is_file() or path.stem.endswith("_native"):
+                        continue
+                    original_id = path.stem
                     new_id = id_map.setdefault(
                         (root, original_id), f"{run_tag}_{original_id}"
                     )
-                    original_file = f"{original_id}.cif"
+                    original_file = path.name
                     new_file = _make_new_file_name(original_file, new_id)
                     source_mappings.append(
                         (original_id, new_id, original_file, new_file)
@@ -1585,6 +1763,35 @@ def merge_command(args: argparse.Namespace) -> None:
                 continue
 
             dest_dir.mkdir(parents=True, exist_ok=True)
+
+            for molecule in sorted((src_dir / const.molecules_dirname).glob("*.pkl")):
+                destination = dest_dir / const.molecules_dirname / molecule.name
+                previous = molecule_sources.get(molecule.name)
+                if previous is None and destination.exists():
+                    previous = destination
+                if previous is not None:
+                    previous_bytes = previous.read_bytes()
+                    current_bytes = molecule.read_bytes()
+                    if previous_bytes != current_bytes:
+                        # Repeated SMILES parsing generates different reference
+                        # conformers. Preserve all ordered chemistry/properties
+                        # while allowing those stochastic coordinates to differ.
+                        flags = (
+                            Chem.PropertyPickleOptions.AllProps
+                            | Chem.PropertyPickleOptions.NoConformers
+                        )
+                        previous_mol = pickle.loads(previous_bytes)  # noqa: S301
+                        current_mol = pickle.loads(current_bytes)  # noqa: S301
+                        if previous_mol.ToBinary(flags) != current_mol.ToBinary(flags):
+                            message = (
+                                f"Conflicting molecule definition for {molecule.stem}: "
+                                f"{molecule} and {previous}"
+                            )
+                            raise ValueError(message)
+                    if molecule.name in molecule_sources:
+                        continue
+                _copy_path(molecule, destination, required=True)
+                molecule_sources[molecule.name] = molecule
 
             seq_path = src_dir / "ca_coords_sequences.pkl.gz"
             if seq_path.exists():
@@ -1626,7 +1833,6 @@ def merge_command(args: argparse.Namespace) -> None:
 
         return merged_count
 
-
     def _copy_design_files(
         src_dir: Path,
         dest_dir: Path,
@@ -1636,19 +1842,49 @@ def merge_command(args: argparse.Namespace) -> None:
         new_file: str,
         include_refold: bool,
     ) -> None:
+        source_stem = Path(original_file).stem
+        legacy_source = source_stem.endswith("_gen") and not (
+            src_dir / f"{source_stem}.npz"
+        ).is_file()
+        source_prefix = source_stem[:-4] if legacy_source else original_id
+        source_metadata_suffix = "_metadata.npz" if legacy_source else ".npz"
+        source_metadata = src_dir / f"{source_prefix}{source_metadata_suffix}"
+        if legacy_source and source_metadata.is_file() and any(
+            source_metadata.with_suffix(suffix).is_file()
+            for suffix in (".cif", ".pdb")
+        ):
+            message = (
+                f"Ambiguous legacy metadata for {original_file}: {source_metadata} "
+                "also belongs to a separate coordinate file. Restore the matching "
+                "metadata before merging."
+            )
+            raise ValueError(message)
+        if new_id.endswith("_gen") and not source_metadata.is_file():
+            legacy_metadata = dest_dir / f"{new_id[:-4]}_metadata.npz"
+            if legacy_metadata.is_file():
+                # Ownership of this old alias is ambiguous; do not let the
+                # reader fall back to it for newly copied coordinates.
+                message = (
+                    f"Cannot merge incomplete design {original_file} over legacy "
+                    f"metadata {legacy_metadata}. Restore the source metadata "
+                    "or use a fresh output directory."
+                )
+                raise ValueError(message)
         _copy_path(src_dir / original_file, dest_dir / new_file, required=True)
+        # Publish one canonical layout even for legacy inputs, so replacing a
+        # design cannot leave a competing metadata/native alias selected later.
         _copy_path(
-            src_dir / f"{original_id}.npz",
+            source_metadata,
             dest_dir / f"{new_id}.npz",
             required=False,
         )
         _copy_path(
-            src_dir / f"{original_id}_native.cif",
+            src_dir / f"{source_prefix}_native.cif",
             dest_dir / f"{new_id}_native.cif",
             required=False,
         )
         _copy_path(
-            src_dir / f"{original_id}_native.pdb",
+            src_dir / f"{source_prefix}_native.pdb",
             dest_dir / f"{new_id}_native.pdb",
             required=False,
         )
@@ -1664,30 +1900,28 @@ def merge_command(args: argparse.Namespace) -> None:
                 required=False,
             )
 
-
     def _make_new_file_name(original_file: str, new_id: str) -> str:
         path = Path(original_file)
-        suffix = "".join(path.suffixes)
+        suffix = path.suffix
         return f"{new_id}{suffix}" if suffix else new_id
-
 
     def _slugify_run_tag(path: Path, index: int) -> str:
         slug = re.sub(r"[^0-9A-Za-z]+", "-", path.name).strip("-").lower()
         return slug or f"run{index}"
-
 
     def _copy_path(src: Path, dst: Path, *, required: bool) -> None:
         if src.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
                 dst.unlink()
-            # Try to make a hard link if possible, otherwise copy
-            try:
-                os.link(src, dst)
-            except OSError:
-                shutil.copy2(src, dst)
+            # Prediction writers can overwrite coordinates in place. A merged
+            # run must not share writable files with its source runs.
+            shutil.copy2(src, dst)
         elif required:
             raise FileNotFoundError(f"Required file missing during merge: {src}")
+        else:
+            # Missing companions in a replacement must not retain old data.
+            dst.unlink(missing_ok=True)
 
     if not args.sources:
         raise ValueError("Provide at least one source directory to merge.")
@@ -1702,13 +1936,27 @@ def merge_command(args: argparse.Namespace) -> None:
             continue
         if not root.exists() or not root.is_dir():
             raise FileNotFoundError(f"Source directory not found: {root}")
-        source_roots.append(root)
+        if root not in source_roots:
+            source_roots.append(root)
 
     dest_root.mkdir(parents=True, exist_ok=True)
 
-    run_tags = {
+    base_tags = {
         root: _slugify_run_tag(root, idx + 1) for idx, root in enumerate(source_roots)
     }
+    run_tags: dict[Path, str] = {}
+    used_tags: set[str] = set()
+    reserved_tags = set(base_tags.values())
+    for root, base_tag in base_tags.items():
+        tag = base_tag
+        if tag in used_tags:
+            # Preserve the names of sources whose base tags are already unique.
+            index = 2
+            while f"{base_tag}-{index}" in used_tags | reserved_tags:
+                index += 1
+            tag = f"{base_tag}-{index}"
+        run_tags[root] = tag
+        used_tags.add(tag)
     id_map: dict[tuple[Path, str], str] = {}
 
     total_designs = 0
@@ -1729,7 +1977,7 @@ def merge_command(args: argparse.Namespace) -> None:
             print(f"- merged {merged} designs into {dest_dir}")
 
     if total_designs == 0:
-        print("No designs found to merge.")
+        print("No analyzed designs available for filtering.")
     else:
         print("===============================================")
         print(f"Merged {len(source_roots)} source(s) into {dest_root}")

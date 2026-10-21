@@ -1,3 +1,7 @@
+import os
+import pickle
+from tempfile import TemporaryDirectory
+
 from boltzgen.utils.quiet import quiet_startup
 
 
@@ -17,7 +21,8 @@ import json
 from boltzgen.task.analyze.analyze_utils import (
     TARGET_ID_RE,
     calc_hydrophobicity,
-    compute_liability_metrics,
+    compute_chain_liability_metrics,
+    chain_hydrophobicity,
     compute_novelty_foldseek,
     compute_rmsd,
     compute_ss_metrics,
@@ -51,6 +56,35 @@ from boltzgen.data import const
 from boltzgen.task.task import Task
 from boltzgen.data.data import Structure
 from boltzgen.data.write.mmcif import to_mmcif
+from boltzgen.task.esmfold2.contract import (
+    SCORE_DIR,
+    file_sha256,
+    fingerprint,
+    load_result,
+)
+
+
+_WORKER_ANALYZE: "Analyze | None" = None
+_MAX_STALLED_POOLS = 3
+
+
+def _init_worker(state_path: Path) -> None:
+    """Keep one analysis task per spawned worker and configure its CPU pools."""
+    global _WORKER_ANALYZE  # noqa: PLW0603
+    # Spawned workers do not inherit torch settings from the parent. Let Torch
+    # honor explicit OMP/MKL settings; otherwise avoid nested CPU parallelism.
+    if not any(os.environ.get(key) for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")):
+        torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    rdkit.Chem.SetDefaultPickleProperties(rdkit.Chem.PropertyPickleOptions.AllProps)
+    with state_path.open("rb") as handle:
+        _WORKER_ANALYZE = pickle.load(handle)  # noqa: S301 -- trusted parent snapshot
+
+
+def _worker_compute_metrics(idx: int) -> str | None:
+    """Submit only the sample index after initialization transfers the dataset."""
+    assert _WORKER_ANALYZE is not None
+    return _WORKER_ANALYZE.compute_metrics(idx)
 
 
 class Analyze(Task):
@@ -71,6 +105,7 @@ class Analyze(Task):
         backbone_fold_metrics: bool = False,
         allatom_fold_metrics: bool = True,
         affinity_metrics: bool = False,
+        esmfold2_metrics: bool = False,
         noncovalents_original: bool = False,
         noncovalents_refolded: bool = False,
         diversity_original: bool = False,
@@ -137,6 +172,7 @@ class Analyze(Task):
         self.compute_lddts = compute_lddts
         self.run_clustering = run_clustering
         self.affinity_metrics = affinity_metrics
+        self.esmfold2_metrics = esmfold2_metrics
         self.fold_metrics = backbone_fold_metrics or allatom_fold_metrics
         self.backbone_fold_metrics = backbone_fold_metrics
         self.allatom_fold_metrics = allatom_fold_metrics
@@ -154,10 +190,6 @@ class Analyze(Task):
         self.slurm = slurm
         self.diversity_subset = diversity_subset
         self.use_design_mask_for_target = use_design_mask_for_target
-
-        # Prevent each worker process from spawning its own multithreaded pools
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
 
         if design_dir is not None:
             self.init_datasets(design_dir, load_dataset=False)
@@ -189,8 +221,10 @@ class Analyze(Task):
 
     def run_parallel(self, num, num_processes):
         """
-        Run tasks  in parallel. If a worker crashes and the pool breaks,
-        restart a fresh pool and only rerun tasks that truly didn't finish.
+        Run tasks in parallel, retrying unconfirmed work after a worker crashes.
+
+        Stop after three consecutive broken pools make no progress. A task whose
+        result was lost with its worker may execute again, even if it wrote files.
         """
         ctx = multiprocessing.get_context("spawn")
 
@@ -198,41 +232,63 @@ class Analyze(Task):
         completed_task_ids = set()
         sample_ids = []
 
-        pbar = tqdm(total=num, desc="Processing samples")
-
-        while completed_task_ids != all_task_ids:
-            remaining = sorted(all_task_ids - completed_task_ids)
-
-            try:
+        # Preserve RDKit atom properties in the worker snapshot.
+        rdkit.Chem.SetDefaultPickleProperties(rdkit.Chem.PropertyPickleOptions.AllProps)
+        if not all_task_ids:
+            return sample_ids
+        stalled_pools = 0
+        with TemporaryDirectory(prefix="boltzgen-analysis-") as state_dir, tqdm(
+            total=num, desc="Processing samples"
+        ) as pbar:
+            state_path = Path(state_dir) / "analysis.pkl"
+            while completed_task_ids != all_task_ids:
+                remaining = sorted(all_task_ids - completed_task_ids)
+                completed_before = len(completed_task_ids)
+                # Large initargs block spawn while each child imports modules.
+                # A small path lets workers start and load their state in parallel.
+                # Ordinary pickle is read-many; multiprocessing's tensor reducers
+                # can instead encode handles that only one reader may consume.
+                with state_path.open("wb") as handle:
+                    pickle.dump(self, handle, protocol=pickle.HIGHEST_PROTOCOL)
                 with ProcessPoolExecutor(
-                    max_workers=num_processes, mp_context=ctx
+                    max_workers=min(num_processes, len(remaining)),
+                    mp_context=ctx,
+                    initializer=_init_worker,
+                    initargs=(state_path,),
                 ) as ex:
-                    fut2idx = {ex.submit(self.compute_metrics, i): i for i in remaining}
+                    fut2idx = {}
+                    try:
+                        for idx in remaining:
+                            fut2idx[ex.submit(_worker_compute_metrics, idx)] = idx
+                    except BrokenProcessPool:
+                        # Still collect every confirmed result submitted so far.
+                        pass
 
-                    # Iterate over futures that actually *completed* (finished or raised)
-                    for f in as_completed(fut2idx):
-                        idx = fut2idx[f]
+                    for future in as_completed(fut2idx):
                         try:
-                            sid = f.result()
-                            if sid is not None:
-                                sample_ids.append(sid)
-                            # Count successful completion
-                            completed_task_ids.add(idx)
-                            pbar.update(1)
-
+                            sid = future.result()
                         except BrokenProcessPool:
-                            # Pool is dead, mark this idx completed.
-                            # Let the outer except restart a fresh pool for all unfinished.
-                            completed_task_ids.add(idx)
-                            pbar.update(1)
-                            raise
+                            # A broken future does not identify the crashed task.
+                            # Retry all unconfirmed tasks in the next pool.
+                            continue
+                        if sid is not None:
+                            sample_ids.append(sid)
+                        completed_task_ids.add(fut2idx[future])
+                        pbar.update(1)
 
-            except BrokenProcessPool:
-                print("\nPOOL BROKEN: A worker died. Restarting with remaining tasks…")
-                # Nothing else to do: the while-loop will retry only the unfinished tasks.
-                continue
+                if completed_task_ids != all_task_ids:
+                    stalled_pools = (
+                        stalled_pools + 1
+                        if len(completed_task_ids) == completed_before
+                        else 0
+                    )
+                    if stalled_pools >= _MAX_STALLED_POOLS:
+                        raise BrokenProcessPool(
+                            "Analysis workers failed in three consecutive pools "
+                            "without completing a task."
+                        )
+                    print("\nPOOL BROKEN: A worker died. Restarting with remaining tasks…")
 
-        pbar.close()
         return sample_ids
 
     def run(self, config=None, run_prediction=False):
@@ -250,7 +306,7 @@ class Analyze(Task):
             msg = "There were 0 samples to compute metrics for. Skipping the distribute_tasks step that calls compute_metrics"
             print(msg)
             return
-        num_processes = min(self.num_processes, multiprocessing.cpu_count())
+        num_processes = min(self.num_processes, multiprocessing.cpu_count(), num)
         if num_processes == 1:
             for idx in tqdm(range(num)):
                 sample_id = self.compute_metrics(idx)
@@ -361,7 +417,12 @@ class Analyze(Task):
             df = self.run_foldseek_clustering(df)
         # Write individual metrics to disk
         csv_path = Path(self.design_dir) / f"aggregate_metrics_{self.name}.csv"
-        df.to_csv(csv_path, float_format="%.5f", index=False)
+        # Polymer score provenance is checked at full precision by filtering.
+        df.to_csv(
+            csv_path,
+            float_format="%.17g" if self.esmfold2_metrics else "%.5f",
+            index=False,
+        )
 
         # Store ca coords and seq in a pickle file for later usage in e.g. diversity aware filtering
         data_rows = []
@@ -370,11 +431,14 @@ class Analyze(Task):
                 {
                     "id": data["sample_id"],
                     "target_id": data["target_id"],
-                    "sequence": "".join(
-                        [
-                            const.prot_token_to_letter[const.tokens[t]]
-                            for t in data["design_seq"]
-                        ]
+                    "sequence": data.get(
+                        "sequence",
+                        "".join(
+                            [
+                                const.prot_token_to_letter.get(const.tokens[t], "X")
+                                for t in data["design_seq"]
+                            ]
+                        ),
                     ),
                     "ca_coords": json.dumps(data["ca_coords"].numpy().tolist()),
                 }
@@ -535,67 +599,57 @@ class Analyze(Task):
             print(msg)
             return None
 
-        # Get designed sequence
+        # Protein sequence metrics exclude padding and designed nonprotein tokens.
         res_type_argmax = torch.argmax(feat["res_type"], dim=-1)
-        design_seq_tensor = res_type_argmax[
-            feat["design_mask"].bool() & feat["token_pad_mask"].bool()
-        ]
-        design_chain_id = feat["asym_id"][
-            torch.where(feat["design_mask"].bool() & feat["token_pad_mask"].bool())[0][
-                0
-            ]
-        ].item()
-        design_chain_seq = res_type_argmax[design_chain_id == feat["asym_id"]]
-        design_seq = "".join(
-            [
-                const.prot_token_to_letter.get(const.tokens[t], "X")
-                for t in design_seq_tensor
-            ]
+        protein_mask = feat["token_pad_mask"].bool() & (
+            feat["mol_type"] == const.chain_type_ids["PROTEIN"]
         )
-        design_chain_seq = "".join(
-            [
-                const.prot_token_to_letter.get(const.tokens[t], "X")
-                for t in design_chain_seq
-            ]
+        protein_design_mask = feat["design_mask"].bool() & protein_mask
+        design_seq_tensor = res_type_argmax[protein_design_mask]
+        designed_chain_ids = list(
+            dict.fromkeys(feat["asym_id"][protein_design_mask].tolist())
         )
+        full_sequences = {}
+        designed_sequences = {}
+        for chain_id in designed_chain_ids:
+            chain_mask = (feat["asym_id"] == chain_id) & protein_mask
+            full_sequences[chain_id] = "".join(
+                const.prot_token_to_letter.get(const.tokens[t], "X")
+                for t in res_type_argmax[chain_mask]
+            )
+            designed_sequences[chain_id] = "".join(
+                const.prot_token_to_letter.get(const.tokens[t], "X")
+                for t in res_type_argmax[chain_mask & protein_design_mask]
+            )
 
-        # initialize metrics
+        # A colon preserves chain boundaries in display and sequence identity keys.
+        design_seq = ":".join(designed_sequences.values())
         metrics = {
             "id": sample_id,
             "file_name": path.name,
             "designed_sequence": design_seq,
-            "designed_chain_sequence": design_chain_seq,
+            "designed_chain_sequence": ":".join(full_sequences.values()),
         }
-
-        # Add per-chain sequences to csv when designing multiple chains
-        design_token_indices = torch.where(feat["design_mask"].bool() & feat["token_pad_mask"].bool())[0]
-        designed_chain_ids = feat["asym_id"][design_token_indices].unique().tolist()
         if len(designed_chain_ids) > 1:
             for chain_id in designed_chain_ids:
-                chain_mask = feat["asym_id"] == chain_id
+                metrics[f"designed_sequence_{chain_id}"] = designed_sequences[chain_id]
+                metrics[f"full_sequence_{chain_id}"] = full_sequences[chain_id]
 
-                # Full chain sequence
-                chain_res_types = res_type_argmax[chain_mask]
-                full_chain_seq = "".join(
-                    [
-                        const.prot_token_to_letter.get(const.tokens[t], "X")
-                        for t in chain_res_types
-                    ]
+        if self.esmfold2_metrics:
+            import json
+
+            score_dir = self.design_dir / SCORE_DIR
+            request = json.loads((score_dir / f"{feat['id']}.input.json").read_text())
+            if request["design_sha256"] != file_sha256(path):
+                raise ValueError(
+                    f"ESMFold2 input for {path} is stale; rerun esmfold2_scoring"
                 )
-
-                # Designed residues only from this chain
-                design_chain_mask = feat["design_mask"].bool() & feat["token_pad_mask"].bool() & chain_mask
-                design_res_types = res_type_argmax[design_chain_mask]
-                design_seq = "".join(
-                    [
-                        const.prot_token_to_letter.get(const.tokens[t], "X")
-                        for t in design_res_types
-                    ]
-                )
-
-                metrics[f"designed_sequence_{chain_id}"] = design_seq
-                metrics[f"full_sequence_{chain_id}"] = full_chain_seq
-
+            result = load_result(score_dir / f"{feat['id']}.json", fingerprint(request))
+            metrics.update(result["metrics"])
+            metrics["esmfold2_input_hash"] = result["input_hash"]
+            metrics["esmfold2_selected_sample"] = result["selected_sample"]
+            if result.get("scoring_mode") == "redesign":
+                metrics["esmfold2_score_metric"] = result["score_metric"]
 
         target_id = re.search(rf"{self.data.cfg.target_id_regex}", sample_id).group(1)
 
@@ -608,9 +662,10 @@ class Analyze(Task):
         # For symmetric designs where all chains have designed residues, use design_mask
         # instead of chain_design_mask so "target" = non-designed residues (not empty)
         if self.use_design_mask_for_target:
-            target_resolved_mask = (~design_mask) & feat["token_resolved_mask"].bool()
+            target_mask = ~design_mask
         else:
-            target_resolved_mask = (~chain_design_mask) & feat["token_resolved_mask"].bool()
+            target_mask = ~chain_design_mask
+        target_resolved_mask = target_mask & feat["token_resolved_mask"].bool()
         atom_design_resolved_mask = (
             (feat["atom_to_token"].float() @ design_resolved_mask.unsqueeze(-1).float())
             .bool()
@@ -622,8 +677,13 @@ class Analyze(Task):
             .squeeze()
         )
         atom_resolved_mask = feat["atom_resolved_mask"]
-        resolved_atoms_design_mask = atom_design_resolved_mask[atom_resolved_mask]
-        resolved_atoms_target_mask = atom_target_resolved_mask[atom_resolved_mask]
+        # SASA uses every present atom even when its representative is absent.
+        atom_target_mask = (
+            (feat["atom_to_token"].float() @ target_mask.unsqueeze(-1).float())
+            .bool()
+            .squeeze()
+        )
+        resolved_atoms_target_mask = atom_target_mask[atom_resolved_mask]
         atom_chain_mask = (
             (
                 feat["atom_to_token"].float()
@@ -632,6 +692,9 @@ class Analyze(Task):
             .bool()
             .squeeze()
         )
+        # Interface SASA includes fixed scaffold atoms and covalently attached
+        # components of every designed chain, not just redesigned residues.
+        resolved_atoms_chain_mask = atom_chain_mask[atom_resolved_mask]
 
         # Get masks for native structure
         if self.native:
@@ -711,7 +774,7 @@ class Analyze(Task):
             ) = get_delta_sasa(
                 path,
                 atom_target_mask=resolved_atoms_target_mask,
-                atom_design_mask=resolved_atoms_design_mask,
+                atom_design_mask=resolved_atoms_chain_mask,
             )
             metrics["delta_sasa_original"] = delta_sasa_orig
             metrics["design_sasa_unbound_original"] = design_sasa_unbound
@@ -731,7 +794,7 @@ class Analyze(Task):
         # Sequence metrics
         if self.sequence_recovery:
             native_seq = torch.argmax(feat["native_res_type"], dim=-1)[
-                native_design_mask
+                native_design_mask & protein_mask
             ]
             metrics["seq_recovery"] = (
                 (design_seq_tensor == native_seq).float().mean().item()
@@ -784,11 +847,23 @@ class Analyze(Task):
             metrics["helix"] = float("nan")
             metrics["sheet"] = float("nan")
 
+        # Evaluate each chain with its own termini and length correction.
+        metrics["design_chain_hydrophobicity"] = chain_hydrophobicity(full_sequences)
+        metrics["design_hydrophobicity"] = chain_hydrophobicity(designed_sequences)
+        if len(designed_chain_ids) > 1:
+            for chain_id in designed_chain_ids:
+                metrics[f"design_chain_hydrophobicity_{chain_id}"] = (
+                    calc_hydrophobicity(full_sequences[chain_id])
+                )
+                metrics[f"design_hydrophobicity_{chain_id}"] = calc_hydrophobicity(
+                    designed_sequences[chain_id]
+                )
+
         # Liability analysis
-        if self.liability_analysis:
+        if self.liability_analysis and full_sequences:
             try:
-                liability_metrics = compute_liability_metrics(
-                    design_chain_seq,
+                liability_metrics = compute_chain_liability_metrics(
+                    full_sequences,
                     self.liability_modality,
                     self.liability_peptide_type,
                 )
@@ -1038,8 +1113,12 @@ class Analyze(Task):
                 metrics["native_rmsd_bb_refolded"] = bb_refold_target_rmsd.item()
 
             # Save the refolded structure of the design to a pdb file if novelty computation needs to be run on it later.
+            des_refold_pdb_dir = self.des_refold_pdb_dir
+            if suffix is not None:
+                des_refold_pdb_dir = des_refold_pdb_dir / suffix
+                des_refold_pdb_dir.mkdir(exist_ok=True, parents=True)
             des_refold_pdb_path = (
-                self.des_refold_pdb_dir / f"{feat['id']}_des_refold.pdb"
+                des_refold_pdb_dir / f"{feat['id']}_des_refold.pdb"
             )
             des_refold_cif_path = des_refold_pdb_path.with_suffix(".cif")
             if self.novelty_refolded or self.novelty_per_target_refolded:
@@ -1072,12 +1151,6 @@ class Analyze(Task):
             if des_refold_cif_path is not None:
                 des_refold_cif_path.unlink(missing_ok=True)
 
-            # Compute sequence based hydrophobicity
-            metrics["design_chain_hydrophobicity"] = calc_hydrophobicity(
-                design_chain_seq
-            )
-            metrics["design_hydrophobicity"] = calc_hydrophobicity(design_seq)
-
             # delta sasa for refolded
             if self.delta_sasa_refolded:
                 cif_path_refolded = self.refold_cif_dir / f"{feat['id']}.cif"
@@ -1095,7 +1168,7 @@ class Analyze(Task):
                 ) = get_delta_sasa(
                     cif_path_refolded,
                     atom_target_mask=resolved_atoms_target_mask,
-                    atom_design_mask=resolved_atoms_design_mask,
+                    atom_design_mask=resolved_atoms_chain_mask,
                 )
 
                 metrics["delta_sasa_refolded"] = delta_sasa_refolded
@@ -1155,6 +1228,7 @@ class Analyze(Task):
             "target_id": target_id,
             "sample_id": sample_id,
             "design_seq": design_seq_tensor.cpu(),
+            "sequence": design_seq,
             "ca_coords": ca_coords.cpu(),
             "ca_coords_refolded": ca_coords_refolded,
         }
@@ -1181,8 +1255,14 @@ class Analyze(Task):
 
             seq = data["design_seq"]
             try:
-                seq = "".join(
-                    [const.prot_token_to_letter[const.tokens[t]] for t in seq]
+                seq = data.get(
+                    "sequence",
+                    "".join(
+                        [
+                            const.prot_token_to_letter.get(const.tokens[t], "X")
+                            for t in seq
+                        ]
+                    ),
                 )
                 sequences[data["target_id"]].append(seq)
             except KeyError as e:
@@ -1327,11 +1407,11 @@ class Analyze(Task):
             )
             nov_csv = Path(design_dir) / f"novelty_per_target_original_{self.name}.csv"
             nov_df.to_csv(nov_csv, index=False, float_format="%.5f")
-            avg_metrics["mean_novelty_per_target_original"] = (
-                nov_df["novelty"].mean().round(5)
+            avg_metrics["mean_novelty_per_target_original"] = round(
+                nov_df["novelty"].mean(), 5
             )
-            avg_metrics["median_novelty_per_target_original"] = (
-                nov_df["novelty"].median().round(5)
+            avg_metrics["median_novelty_per_target_original"] = round(
+                nov_df["novelty"].median(), 5
             )
             metrics_data["nov_df"] = nov_df
 
@@ -1362,8 +1442,8 @@ class Analyze(Task):
             )
             nov_csv = Path(design_dir) / f"novelty_per_target_refolded_{self.name}.csv"
             nov_df_refold.to_csv(nov_csv, index=False, float_format="%.5f")
-            avg_metrics["mean_novelty_per_target_refolded"] = (
-                nov_df_refold["novelty"].mean().round(5)
+            avg_metrics["mean_novelty_per_target_refolded"] = round(
+                nov_df_refold["novelty"].mean(), 5
             )
             avg_metrics["median_novelty_per_target_refolded"] = round(
                 nov_df_refold["novelty"].median(), 5

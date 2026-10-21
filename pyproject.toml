@@ -14,8 +14,12 @@ readme = { file = "PYPI_DESCRIPTION.md", content-type = "text/markdown" }
 description = "Protein design"
 dependencies = [
     # Add runtime dependencies here
-    "numpy==2.0.2; platform_system != 'Darwin'",
-    "numba==0.61.0; platform_system != 'Darwin'",
+    # Qualify new minor versions before extending these bounds; see docs/dependencies.md.
+    # macOS wheels are qualified separately (Python 3.14, torch 2.14), so no upper bound there.
+    "numpy>=2.0.2,<2.5; platform_system != 'Darwin'",
+    "numpy>=2.0.2; platform_system == 'Darwin'",
+    "numba>=0.61.0,<0.66; platform_system != 'Darwin'",
+    "numba>=0.61.0; platform_system == 'Darwin'",
     "matplotlib",
     "hydride",
     "biotite",
@@ -39,6 +43,7 @@ dependencies = [
     "cuequivariance_torch>=0.5.0; platform_system != 'Darwin'",
     "huggingface_hub",
     "biopython", 
+    "uv>=0.12.3,<0.13",
 ]
 
 # Enables the usage of setuptools_scm
@@ -52,7 +57,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-boltzgen = ["resources/config/**/*"]
+boltzgen = ["resources/config/**/*", "resources/runtime/*.txt", "resources/metrics_normalization.json", "_vendor/ligandmpnn/LICENSE", "_vendor/ligandmpnn/NOTICE.md", "task/esmfold2/LICENSE.*", "task/esmfold2/NOTICE.md"]
 
 [project.scripts]
 boltzgen = "boltzgen.cli.boltzgen:main"

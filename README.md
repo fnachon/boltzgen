@@ -15,6 +15,9 @@ In an environment with python >=3.11:
 pip install boltzgen
 ```
 
+See [NumPy and Numba compatibility](docs/dependencies.md) for dependency bounds
+and tested Python 3.11 and 3.13 combinations.
+
 <details>
   <summary style="font-size: 1.3em; font-weight: 600;">
     Click for detailed installation instructions
@@ -105,7 +108,7 @@ docker build -t boltzgen:weights --build-arg DOWNLOAD_WEIGHTS=true .
 
 
 `boltzgen run` takes a [design specification](#how-to-make-a-design-specification-yaml) `.yaml` and produces a set of ranked designs.\
-⚠️ it downloads models (~6GB) to `~/.cache`. This can by changed by passing `--cache YOUR_PATH` or by setting `$HF_HOME`.\
+⚠️ Models download automatically: ~6 GB for Boltz, plus ~33 GB for ESMFold2 weights and runtime. ESMFold2 requires a CUDA 13 compatible NVIDIA driver. See [installation and cache settings](docs/esmfold2.md#installation-and-use).\
 ⚠️ If your run is ever interrupted, you can restart it with `--reuse`. No progress is lost.
 
 ```bash
@@ -157,16 +160,22 @@ When the pipeline completes your output directory will have:
 
 # Protocols
 
+SolubleMPNN is the default inverse-folding model, with [ESMFold2 scoring](docs/esmfold2.md).
+The `protein-small_molecule` protocol instead uses BoltzIF and Boltz2 affinity.
+
 | Protocol (design-target) | Appropriate for                                                           | Major config differences        |
 |--------------------------|---------------------------------------------------------------------------|------------------------|
 | protein-anything         | Design proteins to bind proteins or peptides                              | Includes `design folding` step. |
 | peptide-anything         | Design (cyclic) peptides or others to bind proteins | No Cys are generated in inverse folding. No `design folding` step. Don't compute largest hydrophobic patch. |
 | protein-small_molecule   | Design proteins to bind small molecules                                | Includes binding affinity prediction. Includes `design folding` step. |
-| antibody-anything        | Design antibody CDRs      | No Cys are generated in inverse folding. No `design folding` step. Don't compute largest hydrophobic patch. |
+| antibody-anything        | Design antibody CDRs      | No Cys are generated in inverse folding. No `design folding` step. Don't compute largest hydrophobic patch. Antibody liability rules in analysis and reporting. |
 | nanobody-anything        | Design nanobody CDRs      | Same settings as antibody-anything |
 | protein-redesign         | Redesign or optimize existing proteins | No `design folding` step. Uses `design_mask` for target/template definition. |
 
 All configuration parameters can be overridden using the `--config` option; see `boltzgen run --help` or the `Advanced Users` section below for details.
+
+See [multichain sequence analysis](docs/sequence-analysis.md) for per-chain
+metrics, aggregation, liability defaults, and report conventions.
 
 
 
@@ -328,6 +337,8 @@ constraints:
 
 For symmetric complexes (e.g., homo-dimers), the you can tie sequence generation during inverse folding by specifying the `symmetric_group` for each symmetric chain. The `protein-redesign` protocol allows for scoring complexes without separate binders/targets.
 
+Sequence tying works with `--only_inverse_fold` and after backbone generation.
+
 ```yaml
 entities:
   - file:
@@ -426,7 +437,7 @@ The `boltzgen run` command executes the BoltzGen binder design pipeline. Here ar
 - `design_spec` - Path(s) to design specification YAML file(s), or a directory containing prepared configs
 
 ### General Configuration
-- `--protocol {protein-anything,peptide-anything,protein-small_molecule,nanobody-anything,antibody-anything}` - Protocol to use for the design. This determines default settings and in some cases what steps are run. Default: protein-anything. See [Protocols](#protocols) section for details.
+- `--protocol {protein-anything,peptide-anything,protein-small_molecule,nanobody-anything,antibody-anything,protein-redesign}` - Protocol to use for the design. This determines default settings and in some cases what steps are run. Default: protein-anything. See [Protocols](#protocols) section for details.
 - `--output OUTPUT` - Output directory for pipeline results
 - `--config CONFIG [CONFIG ...]` - Override pipeline step configuration, in format `<step_name> <arg1>=<value1> <arg2>=<value2> ...` (example: `--config folding num_workers=4 trainer.devices=4`). Can be used multiple times.
 - `--devices DEVICES` - Number of devices to use. Default is all devices available.
@@ -446,7 +457,10 @@ The `boltzgen run` command executes the BoltzGen binder design pipeline. Here ar
 ### Inverse Folding
 - `--skip_inverse_folding` - Skip inverse folding step
 - `--inverse_fold_num_sequences INVERSE_FOLD_NUM_SEQUENCES` - Number of sequences per backbone to generate in the inverse fold step. Default: 1
-- `--inverse_fold_checkpoint INVERSE_FOLD_CHECKPOINT` - Path or huggingface repo and filename for the inverse fold checkpoint. Default: `huggingface:boltzgen/boltzgen1_ifold:boltzgen1_ifold.ckpt`
+- `--inverse_fold_model {boltzif,solublempnn}` - Sequence model. Default: BoltzIF for `protein-small_molecule` (required), SolubleMPNN for other protocols.
+- `--solublempnn_checkpoint CHECKPOINT` - Local path or Hugging Face artifact for SolubleMPNN weights. Default: automatically download/cache the upstream `solublempnn_v_48_020.pt` checkpoint.
+- `--solublempnn_sampling_temperature FLOAT` - Finite positive SolubleMPNN sampling temperature. Default: 0.1.
+- `--inverse_fold_checkpoint INVERSE_FOLD_CHECKPOINT` - BoltzIF checkpoint, used for `protein-small_molecule` or with `--inverse_fold_model boltzif`. Default: `huggingface:boltzgen/boltzgen-1:boltzgen1_ifold.ckpt`.
 - `--inverse_fold_avoid INVERSE_FOLD_AVOID` - Disallowed residues as a string of one letter amino acid codes, e.g. 'KEC'. This is implemented at the inverse fold step, so it only affects results if inverse folding is enabled. Default: none for protein design, 'C' for peptide and nanobody design. Pass an empty list if you want Cysteins to be generated if you are using a nanobody or peptide protocol
 - `--only_inverse_fold` - Skip design step and only run inverse folding. Requires a fully specified structure.
 
@@ -470,13 +484,13 @@ The `boltzgen run` command executes the BoltzGen binder design pipeline. Here ar
 ### Model and Data Download Options
 - `--force_download` - Force a (re)-download of models and data.
 - `--models_token MODELS_TOKEN` - Secret token to use for our models hosting service (Hugging Face). Default: `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`
-- `--cache CACHE` - Directory where downloaded models will be stored. Default: `~/.cache`
+- `--cache CACHE` - Directory for Boltz models and data. Default: `~/.cache`. ESM checkpoints use `HF_HOME`/`HF_HUB_CACHE`; the ESM runtime uses `UV_CACHE_DIR`.
 
 ## `boltzgen download`
 
 The `boltzgen download` command downloads model weights and data artifacts needed for BoltzGen. In most cases you don't need to use `boltzgen download`, since `boltzgen run` will download what is needed automatically.
 
-Downloaded weights and datasets are stored in `~/.cache` by default but this can be changed by specifying `--cache`.
+Downloaded Boltz weights and datasets are stored in `~/.cache` by default but this can be changed by specifying `--cache`. ESMFold2 weights and runtime use the separate caches described in [the ESMFold2 installation guide](docs/esmfold2.md#installation-and-use).
 
 ### Example
 
@@ -496,7 +510,7 @@ boltzgen download [-h] [--force_download] [--models_token MODELS_TOKEN] [--cache
 ### Options
 - `--force_download` - Force a (re)-download of models and data.
 - `--models_token MODELS_TOKEN` - Secret token to use for our models hosting service. Not usually required.
-- `--cache CACHE` - Directory where downloaded models will be stored. Default: `~/.cache`
+- `--cache CACHE` - Directory for Boltz models and data. Default: `~/.cache`. ESM checkpoints use `HF_HOME`/`HF_HUB_CACHE`; the ESM runtime uses `UV_CACHE_DIR`.
 
 ## `boltzgen configure`
 For more control over your design process, you can separate the configuration generation from execution:

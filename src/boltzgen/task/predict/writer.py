@@ -1,5 +1,8 @@
+import os
 import pickle
+import json
 from pathlib import Path
+import tempfile
 from typing import Dict, List
 
 import numpy as np
@@ -10,6 +13,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from boltzgen.data import const
+from boltzgen.data.source_context import update_designed
 from boltzgen.data.data import (
     Structure,
     convert_ccd,
@@ -23,6 +27,59 @@ from boltzgen.data.write.mmcif import to_mmcif
 from boltzgen.data.write.pdb import to_pdb
 from boltzgen.model.loss.diffusion import weighted_rigid_align
 from boltzgen.model.modules.masker import BoltzMasker
+
+
+def _existing_output_alias(
+    output_dir: Path, source_stem: str, sample_index: int, file_suffix: str
+) -> tuple[str | None, bool]:
+    """Find an output using this sample index despite changed zero padding."""
+    output_stems = {
+        path.stem
+        for path in output_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in {".cif", ".npz"}
+    }
+    matches = []
+    for output_stem in output_stems:
+        normalized_stem = output_stem
+        if file_suffix and normalized_stem.endswith(file_suffix):
+            normalized_stem = normalized_stem[: -len(file_suffix)]
+        if normalized_stem == source_stem:
+            output_index = 0
+        else:
+            prefix = f"{source_stem}_"
+            sample = (
+                normalized_stem[len(prefix) :]
+                if normalized_stem.startswith(prefix)
+                else ""
+            )
+            if not sample.isdigit():
+                continue
+            output_index = int(sample)
+        if output_index == sample_index:
+            matches.append(output_stem)
+
+    for output_stem in sorted(matches):
+        if (
+            (output_dir / f"{output_stem}.cif").is_file()
+            and (output_dir / f"{output_stem}.npz").is_file()
+        ):
+            return output_stem, True
+    return (sorted(matches)[0], False) if matches else (None, False)
+
+
+def _write_npz_atomically(path: str | Path, **arrays) -> None:
+    path = Path(path)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            np.savez_compressed(temporary_file, **arrays)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 class FoldingWriter(BasePredictionWriter):
@@ -61,53 +118,76 @@ class FoldingWriter(BasePredictionWriter):
         sample_id: str = None,
     ) -> None:
         """Write the predictions to disk."""
+        exception = prediction.get("exception", False)
+        if isinstance(exception, list):
+            exception = exception[0]
+        if exception:
+            self.failed += 1
+            return
+        skip = prediction.get("skip", False)
+        if isinstance(skip, list):
+            skip = skip[0]
+        if skip:
+            return
+
+        # Folding preserves the input molecule identities even when the model
+        # masks them internally. Keep those identities in both NPZ and CIF.
+        prediction = prediction.copy()
+        for key in (
+            "res_type",
+            "ccd",
+            "ref_element",
+            "ref_charge",
+            "ref_atom_name_chars",
+        ):
+            if key in batch:
+                prediction[key] = batch[key]
+
         pred_dict = {}
         for key, value in prediction.items():
             # check object is tensor
             if key in const.eval_keys:
                 pred_dict[key] = value.cpu().numpy()
-        np.savez_compressed(self.outdir / f"{batch['id'][0]}.npz", **pred_dict)
-
-        # Get best sample
-        confidence = 0.8 * pred_dict["iptm"] + 0.2 * pred_dict["ptm"]
+        # Match the sample selected by analyze_utils.get_best_folding_sample.
+        confidence = (
+            0.8 * pred_dict["design_to_target_iptm"] + 0.2 * pred_dict["design_ptm"]
+        )
         best_idx = np.argmax(confidence)
-        best_sample_coords = pred_dict["coords"][best_idx]
 
         # Per-sample outputs (e.g. plddt) have one entry per diffusion sample, while
         # batch features have a leading batch dim of 1: keep them from the same sample
         num_samples = len(pred_dict["coords"])
         prediction_out = {}
         for k in prediction:
-            if k == "coords":
-                prediction_out[k] = torch.from_numpy(best_sample_coords)
-            elif (
-                num_samples > 1
-                and isinstance(prediction[k], Tensor)
-                and prediction[k].dim() > 0
-                and prediction[k].shape[0] == num_samples
-            ):
+            # Coordinates and pLDDT have a sample axis; structure features have
+            # a batch axis and are shared by all samples of this input.
+            if k in ("coords", "plddt"):
                 prediction_out[k] = prediction[k][best_idx]
+            elif k in ("exception", "skip", "token_level_confidence"):
+                continue
             else:
                 prediction_out[k] = prediction[k][0]
 
         # Write structure
         structure, _, _ = Structure.from_feat(prediction_out)
-        plddt_atom = (
-            prediction_out["atom_to_token"].float() @ prediction_out["plddt"].float()
-        )
+        if prediction.get("token_level_confidence", True):
+            plddt_atom = (
+                prediction_out["atom_to_token"].float()
+                @ prediction_out["plddt"].float()
+            )
+        else:
+            plddt_atom = prediction_out["plddt"].float()
         structure.atoms["bfactor"] = (
             plddt_atom[prediction_out["atom_pad_mask"].bool()].float().cpu().numpy()
         )
         cif_text = to_mmcif(structure)
-        (self.refold_cif_dir / f"{batch['id'][0]}.cif").write_text(cif_text)
-
-        # Failed prediction handling
-        if isinstance(prediction["exception"], bool):
-            if prediction["exception"]:
-                self.failed += 1
-        elif isinstance(prediction["exception"], list):
-            if prediction["exception"][0]:
-                self.failed += 1
+        # Publish the complete archive last. An interrupted overwrite must not
+        # leave an old completion marker paired with a new or partial CIF.
+        archive_path = self.outdir / f"{batch['id'][0]}.npz"
+        archive_path.unlink(missing_ok=True)
+        with open(self.refold_cif_dir / f"{batch['id'][0]}.cif", "w") as cif_file:
+            cif_file.write(cif_text)
+        _write_npz_atomically(archive_path, **pred_dict)
 
     def on_predict_epoch_end(
         self,
@@ -145,19 +225,24 @@ class AffinityWriter(BasePredictionWriter):
         sample_id: str = None,
     ) -> None:
         """Write the predictions to disk."""
+        exception = prediction.get("exception", False)
+        if isinstance(exception, list):
+            exception = exception[0]
+        if exception:
+            self.failed += 1
+            return
+        skip = prediction.get("skip", False)
+        if isinstance(skip, list):
+            skip = skip[0]
+        if skip:
+            return
+
         pred_dict = {}
         for key, value in prediction.items():
             # check object is tensor
             if key in const.eval_keys:
                 pred_dict[key] = value.cpu().numpy()
-        np.savez_compressed(self.outdir / f"{batch['id'][0]}.npz", **pred_dict)
-
-        if isinstance(prediction["exception"], bool):
-            if prediction["exception"]:
-                self.failed += 1
-        elif isinstance(prediction["exception"], list):
-            if prediction["exception"][0]:
-                self.failed += 1
+        _write_npz_atomically(self.outdir / f"{batch['id'][0]}.npz", **pred_dict)
 
     def on_predict_epoch_end(
         self,
@@ -245,7 +330,61 @@ class DesignWriter(BasePredictionWriter):
                     pickle.dump(v, f)
 
         # write samples to disk
+        datamodule = getattr(trainer, "datamodule", None)
+        cfg = getattr(datamodule, "cfg", None)
+        resume_inverse_fold = (
+            self.inverse_fold
+            and getattr(datamodule, "skip_existing", False)
+            and getattr(datamodule, "skip_existing_kind", None) == "inverse_fold"
+        )
         for n in range(n_samples):
+            if sample_id is not None:
+                file_name = f"{sample_id}_{n}{self.file_suffix}"
+            else:
+                stem = str(batch["id"][0])
+                multiplicity = getattr(cfg, "multiplicity", 1)
+                total_files = multiplicity * n_samples
+                sample_idx = (
+                    int(batch["data_sample_idx"][0])
+                    if "data_sample_idx" in batch
+                    else 0
+                )
+                global_idx = sample_idx * n_samples + n
+
+                if total_files > 1:
+                    num_digits = len(str(total_files - 1))
+                    file_name = (
+                        f"{stem}_{global_idx:0{num_digits}d}{self.file_suffix}"
+                    )
+                else:
+                    file_name = f"{stem}{self.file_suffix}"
+
+            native_path = f"{self.outdir}/{file_name}_native.cif"
+            gen_path = f"{self.outdir}/{file_name}.cif"
+            metadata_path = f"{self.outdir}/{file_name}.npz"
+            if resume_inverse_fold:
+                # Completed siblings must keep their sequence and cached refolds
+                # when another item makes the whole backbone run again.
+                if Path(gen_path).is_file() and Path(metadata_path).is_file():
+                    continue
+            elif getattr(cfg, "skip_existing", False):
+                output_dir = Path(self.outdir)
+                if sample_id is None:
+                    alias, complete = _existing_output_alias(
+                        output_dir, stem, global_idx, self.file_suffix
+                    )
+                    if complete:
+                        continue
+                    if alias is not None:
+                        file_name = alias
+                        native_path = f"{self.outdir}/{file_name}_native.cif"
+                        gen_path = f"{self.outdir}/{file_name}.cif"
+                        metadata_path = f"{self.outdir}/{file_name}.npz"
+                elif Path(gen_path).is_file() and Path(metadata_path).is_file():
+                    continue
+            # NPZ is the completion marker for the CIF/metadata pair.
+            Path(metadata_path).unlink(missing_ok=True)
+
             # get structure for all generated coords
             sample, native = {}, {}
 
@@ -294,31 +433,6 @@ class DesignWriter(BasePredictionWriter):
             try:
                 structure, _, _ = Structure.from_feat(sample)
                 str_native, _, _ = Structure.from_feat(native)
-
-                # write structure to cif
-                if sample_id is not None:
-                    file_name = f"{sample_id}_{n}{self.file_suffix}"
-                else:
-                    stem = str(batch["id"][0])
-                    multiplicity = getattr(trainer.datamodule.cfg, "multiplicity", 1)
-                    total_files = multiplicity * n_samples
-                    sample_idx = (
-                        int(batch["data_sample_idx"][0])
-                        if "data_sample_idx" in batch
-                        else 0
-                    )
-                    global_idx = sample_idx * n_samples + n
-
-                    if total_files > 1:
-                        num_digits = len(str(total_files - 1))
-                        file_name = (
-                            f"{stem}_{global_idx:0{num_digits}d}{self.file_suffix}"
-                        )
-                    else:
-                        file_name = f"{stem}{self.file_suffix}"
-
-                native_path = f"{self.outdir}/{file_name}_native.cif"
-                gen_path = f"{self.outdir}/{file_name}.cif"
 
                 # design mask bfactor
                 design_mask = batch["design_mask"][0].float()
@@ -392,14 +506,19 @@ class DesignWriter(BasePredictionWriter):
                 )
 
                 # Write metadata
-                metadata_path = f"{self.outdir}/{file_name}.npz"
                 token_mask = sample["token_pad_mask"].bool()
+
+                context = json.loads(batch.get("source_context", ["null"])[0])
+                if context is not None:
+                    context = update_designed(context, structure)
 
                 # Build metadata dict with required fields
                 metadata_dict = {
+                    "source_context": np.asarray(json.dumps(context)),
                     "design_mask": design_mask[token_mask].cpu().numpy(),
                     "mol_type": sample["mol_type"][token_mask].cpu().numpy(),
                     "ss_type": sample["ss_type"][token_mask].cpu().numpy(),
+                    "symmetric_group": batch["symmetric_group"][0][token_mask].cpu().numpy(),
                     "token_resolved_mask": sample["token_resolved_mask"][token_mask].cpu().numpy(),
                     "binding_type": binding_type[token_mask].cpu().numpy(),
                 }
@@ -417,7 +536,7 @@ class DesignWriter(BasePredictionWriter):
                     if aa_mask.any():  # Only save if there are actual constraints
                         metadata_dict["aa_constraint_mask"] = aa_mask[token_mask].cpu().numpy()
 
-                np.savez_compressed(metadata_path, **metadata_dict)
+                _write_npz_atomically(metadata_path, **metadata_dict)
 
                 # Write trajectories
                 if self.save_traj:

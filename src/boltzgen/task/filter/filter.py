@@ -1,4 +1,5 @@
 import json
+from importlib.resources import files
 from boltzgen.utils.quiet import quiet_startup
 
 
@@ -20,7 +21,10 @@ import heapq
 from textwrap import fill, dedent
 import re
 
-from boltzgen.task.analyze.analyze_utils import compute_liability_scores
+from boltzgen.task.analyze.analyze_utils import (
+    compute_liability_scores,
+    sequence_identity,
+)
 from boltzgen.task.filter.seqplot_utils import (
     aa_composition_pie,
     cdr_logo,
@@ -28,6 +32,34 @@ from boltzgen.task.filter.seqplot_utils import (
     plot_seq_liabilities,
 )
 from boltzgen.task.task import Task
+from boltzgen.task.esmfold2.contract import (
+    SCORE_KEY,
+    REDESIGN_SCORE_KEY,
+    SCORE_DIR,
+    file_sha256,
+    fingerprint,
+    load_result,
+)
+
+
+def _chain_sequences(row: pd.Series, *, full: bool) -> dict[str, str]:
+    """Read the established per-chain CSV fields, with a legacy-row fallback."""
+    prefix = "full_sequence_" if full else "designed_sequence_"
+    sequences = {
+        key.removeprefix(prefix): value
+        for key, value in row.items()
+        if key.startswith(prefix)
+        and key.removeprefix(prefix).isdigit()
+        and isinstance(value, str)
+        and value
+    }
+    if sequences:
+        return sequences
+    value = row.get("designed_chain_sequence" if full else "designed_sequence", "")
+    if not isinstance(value, str) or not value:
+        return {}
+    chains = value.split(":")
+    return {str(i) if len(chains) > 1 else "": seq for i, seq in enumerate(chains)}
 
 
 class Filter(Task):
@@ -97,6 +129,10 @@ class Filter(Task):
     Ranking & Diversity
     -------------------
     **Filtering.** Each design must pass all hard thresholds (``pass_<feature>_filter``).
+    Repeated rules for a feature are combined with AND in its output flag; each
+    rule contributes independently to ``num_filters_passed`` and score penalties.
+    Affinity-score penalties multiply nonnegative scores by 0.1 and negative
+    scores by 10, so failures never improve the signed composite score.
     The step also adds convenience columns (e.g., ``filter_rmsd``,
     ``designfolding-filter_rmsd``, signed variants like ``neg_min_design_to_target_pae``).
 
@@ -105,7 +141,7 @@ class Filter(Task):
     are pushed down), then divide by the metric’s *inverse-importance* weight.
     The **worst** (max) scaled rank across metrics becomes the design’s
     quality key. The Top set is the best `budget` designs by this key (tie-broken
-    by iPTM).
+    by the ESMFold2 score for polymer protocols, or iPTM for affinity).
 
     **Diversity.** A lazy-greedy selection chooses `div_budget` designs maximizing:
     ``(1 - alpha) * quality + alpha * (1 - seq_identity)``.
@@ -153,6 +189,7 @@ class Filter(Task):
         top_budget: int = 10,
         outdir: str = None,
         use_affinity: bool = False,  # This changes the filtering metrics to metrics more amenable to small molecule binder design
+        esmfold2_redesign: bool = False,
         filter_cysteine: bool = True,  # This filters out all designs that have designed cysteins in them (prespecified cysteins in the design are not counted)
         from_inverse_folded: bool = True,  # This makes it so that we use the backbone refolding rmsd instead of the all-atom RMSD
         filter_designfolding: bool = True,  # Additionally filter based on the RMSD from refolding the design in isolation. This makes sure the design has the same shape with and without the target being present.
@@ -178,6 +215,11 @@ class Filter(Task):
         self.design_dir = Path(design_dir)
         self.top_budget = top_budget
         self.use_affinity = use_affinity
+        self.use_esmfold2 = not use_affinity
+        if esmfold2_redesign and use_affinity:
+            raise ValueError("ESMFold2 redesign scoring cannot use Boltz affinity")
+        self.esmfold2_redesign = esmfold2_redesign
+        self.esmfold2_score_key = REDESIGN_SCORE_KEY if esmfold2_redesign else SCORE_KEY
         self.filter_cysteine = filter_cysteine
         self.from_inverse_folded = from_inverse_folded
         self.filter_bindingsite = filter_bindingsite
@@ -220,6 +262,11 @@ class Filter(Task):
                 if from_inverse_folded
                 else "delta_sasa_original": 2,
             }
+
+        else:
+            del self.metrics["design_to_target_iptm"]
+            del self.metrics["neg_min_design_to_target_pae"]
+            self.metrics[self.esmfold2_score_key] = 1
 
         # override metrics
         if not metrics_override is None:
@@ -264,6 +311,7 @@ class Filter(Task):
                 {
                     "feature": "bb_target_aligned<2.5",
                     "lower_is_better": False,
+                    "threshold": True,
                 }
             )
         if filter_cysteine:
@@ -356,10 +404,58 @@ class Filter(Task):
                 f"No file starting with 'aggregate_metrics_' found in {self.design_dir}"
             )
             raise FileNotFoundError(msg)
-        df_in = pd.read_csv(csv_files[0])
+        # "NA" is a valid amino-acid sequence; retain normal NA parsing for metrics.
+        sequence_columns = [
+            column
+            for column in pd.read_csv(csv_files[0], nrows=0).columns
+            if column == "designed_chain_sequence"
+            or column.startswith(("designed_sequence", "full_sequence_"))
+        ]
+        df_in = pd.read_csv(
+            csv_files[0],
+            converters=dict.fromkeys(sequence_columns, lambda value: value or None),
+        )
 
         self.df_in = df_in.copy()
         df = df_in.copy()
+        if self.use_esmfold2:
+            import json
+
+            if self.esmfold2_score_key not in df or "esmfold2_input_hash" not in df:
+                raise ValueError(
+                    "Missing ESMFold2 scores; run esmfold2_scoring and analysis before filtering"
+                )
+            score_metrics = set()
+            for _, row in df.iterrows():
+                score_dir = self.design_dir / SCORE_DIR
+                request = json.loads(
+                    (score_dir / f"{row['id']}.input.json").read_text()
+                )
+                result = load_result(
+                    score_dir / f"{row['id']}.json", fingerprint(request)
+                )
+                expected_mode = "redesign" if self.esmfold2_redesign else "binder"
+                if any(value.get("scoring_mode", "binder") != expected_mode for value in (request, result)):
+                    raise ValueError("ESMFold2 scoring mode does not match this filtering protocol")
+                if self.esmfold2_redesign:
+                    if row.get("esmfold2_score_metric") != result["score_metric"]:
+                        raise ValueError("Aggregated ESMFold2 metric is stale; rerun analysis")
+                    score_metrics.add(result["score_metric"])
+                if row["esmfold2_input_hash"] != result["input_hash"] or not np.isclose(
+                    row[self.esmfold2_score_key], result["metrics"][self.esmfold2_score_key], rtol=0, atol=1e-12
+                ):
+                    raise ValueError(
+                        "Aggregated ESMFold2 scores are stale; rerun analysis"
+                    )
+                if request["design_sha256"] != file_sha256(
+                    self.design_dir / row["file_name"]
+                ):
+                    raise ValueError(
+                        "Design changed after ESMFold2 scoring; rerun esmfold2_scoring and analysis"
+                    )
+
+            if len(score_metrics) > 1:
+                raise ValueError("Rank monomer pTM and multichain ipSAE redesigns in separate campaigns")
 
         if self.from_inverse_folded:
             df["filter_rmsd"] = df["bb_rmsd"]
@@ -383,7 +479,7 @@ class Filter(Task):
         df["neg_min_interaction_pae"] = -df["min_interaction_pae"]
         df["neg_filter_rmsd"] = -df["filter_rmsd"]
         df["neg_filter_rmsd_design"] = -df["filter_rmsd_design"]
-        df["has_x"] = df["designed_sequence"].str.contains("X")
+        df["has_x"] = df["designed_sequence"].fillna("X").str.contains("X")
         self.df = df
 
         print(f"Total number of designs: {len(self.df):>5}")
@@ -392,9 +488,19 @@ class Filter(Task):
         msg = f"Duplicates found: {before - len(self.df)}. Removing duplicates. {len(self.df)} designs remain.\n"
         print(msg)
 
+    def _filter_pass_mask(self, rule: dict) -> pd.Series:
+        """Evaluate one inclusive threshold, treating missing values as failures."""
+        values = self.df[rule["feature"]]
+        if rule["lower_is_better"]:
+            passed = values <= rule["threshold"]
+        else:
+            passed = values >= rule["threshold"]
+        return passed.fillna(value=False)
+
     def filter_df(self):
-        filter_cols = []
+        filter_cols = set()
         self.df["num_filters_passed"] = 0
+        self.df["pass_filters"] = True
 
         for filter in self.filters:
             feat = filter["feature"]
@@ -402,16 +508,20 @@ class Filter(Task):
             threshold = filter["threshold"]
 
             filter_col = f"pass_{feat}_filter"
-            filter_cols.append(filter_col)
-            if low:
-                self.df[filter_col] = self.df[feat] <= threshold
+            passed = self._filter_pass_mask(filter)
+            if filter_col in filter_cols:
+                self.df[filter_col] &= passed
             else:
-                self.df[filter_col] = self.df[feat] >= threshold
+                self.df[filter_col] = passed
+                filter_cols.add(filter_col)
 
-            self.df["num_filters_passed"] += self.df[filter_cols].all(axis=1)
-            self.df["pass_filters"] = self.df[filter_cols].all(axis=1)
+            self.df["num_filters_passed"] += passed.astype(int)
+            self.df["pass_filters"] &= passed
 
-            msg = f"Num designs that pass the {feat} filter with threshold {threshold} where {'lower' if low else 'higher'} is better: {self.df[filter_col].sum()}"
+            msg = (
+                f"Num designs that pass the {feat} filter with threshold {threshold} "
+                f"where {'lower' if low else 'higher'} is better: {passed.sum()}"
+            )
             print(msg)
             print(f"Remaining designs: {self.df['pass_filters'].sum()}")
 
@@ -423,8 +533,12 @@ class Filter(Task):
         print("\n")
 
     def absolute_metrics(self):
-        norm_path = Path("src/boltzgen/resources/metrics_normalization.json")
-        if not norm_path.exists():
+        if not self.use_affinity:
+            # These composite calibrations describe Boltz2 interaction metrics;
+            # applying them to ESMFold2 ipSAE would imply unmeasured calibration.
+            return
+        norm_path = files("boltzgen") / "resources" / "metrics_normalization.json"
+        if not norm_path.is_file():
             return
 
         with norm_path.open("r") as f:
@@ -467,14 +581,16 @@ class Filter(Task):
 
         for flt in self.filters:
             feat = flt["feature"]
-            filter_col = f"pass_{feat}_filter"
+            mask_fail = ~self._filter_pass_mask(flt)
             if "fraction" in feat:
                 # If this is a "fraction" feature, meaning a res_type fraction filter, only apply the penalty if num_design > 8
-                mask_fail = (self.df["num_design"] > 8) & (self.df[filter_col] == False)
-            else:
-                mask_fail = self.df[filter_col] == False
+                mask_fail &= self.df["num_design"] > 8
 
-            self.df.loc[mask_fail, "absolute_score"] *= 0.1
+            # Failed rules must worsen signed z-scores, not reward negative ones.
+            scores = self.df.loc[mask_fail, "absolute_score"]
+            self.df.loc[mask_fail, "absolute_score"] = scores * np.where(
+                scores < 0, 10.0, 0.1
+            )
 
 
     def sort_df(self):
@@ -509,9 +625,13 @@ class Filter(Task):
         self.df = self.df.sort_values(
             by=[
                 "secondary_rank",
-                "design_to_target_iptm"
-                if "design_to_target_iptm" in self.df
-                else "design_iptm",
+                self.esmfold2_score_key
+                if self.use_esmfold2
+                else (
+                    "design_to_target_iptm"
+                    if "design_to_target_iptm" in self.df
+                    else "design_iptm"
+                ),
             ],
             ascending=[True, False],
         )
@@ -526,6 +646,11 @@ class Filter(Task):
             "designed_sequence",
             "designed_chain_sequence",
             "num_design",
+            self.esmfold2_score_key,
+            "esmfold2_score_metric",
+            "esmfold2_ptm",
+            "esmfold2_design_to_target_ipsae",
+            "esmfold2_target_to_design_ipsae",
             "affinity_probability_binary1",
             "design_to_target_iptm"
             if "design_to_target_iptm" in self.df
@@ -617,8 +742,7 @@ class Filter(Task):
             if key not in pid_cache:
                 seq1 = seqs[i]
                 seq2 = seqs[j]
-                aln = aligner.align(seq1, seq2)[0]
-                pid_cache[key] = aln.score / max(len(seqs[i]), len(seqs[j]))
+                pid_cache[key] = sequence_identity(seq1, seq2, aligner)
             return pid_cache[key]
 
         random.seed(self.random_state)
@@ -644,7 +768,7 @@ class Filter(Task):
 
         buckets = np.zeros(len(self.size_buckets) + 1)
         first = selected[0]
-        first_len = len(self.df_m["sequence"][first])
+        first_len = len(self.df_m["sequence"][first].replace(":", ""))
         for idx, bucket_size in enumerate(self.size_buckets):
             if first_len >= bucket_size["min"] and first_len < bucket_size["max"]:
                 buckets[idx] += 1
@@ -654,7 +778,7 @@ class Filter(Task):
         ):
             while True:
                 neg_gain, cand = heapq.heappop(heap)
-                num_design = len(self.df_m["sequence"][cand])
+                num_design = len(self.df_m["sequence"][cand].replace(":", ""))
                 bucket_idx = None
                 for idx, bucket_size in enumerate(self.size_buckets):
                     if (
@@ -823,6 +947,29 @@ class Filter(Task):
         if self.use_affinity:
             summary_metrics.insert(2, "affinity_probability_binary1")
             hist_metrics.insert(2, "affinity_probability_binary1")
+        else:
+            # Keep legacy Boltz confidence columns in the CSV for diagnostics,
+            # but present the score that actually selects polymer binders.
+            interface_columns = {
+                "design_iptm",
+                "design_to_target_iptm",
+                "design_iiptm",
+                "min_design_to_target_pae",
+                "min_interaction_pae",
+            }
+            summary_metrics = [self.esmfold2_score_key] + [
+                k for k in summary_metrics
+                if k not in interface_columns and k != self.esmfold2_score_key
+            ]
+            hist_metrics = [self.esmfold2_score_key] + [
+                k for k in hist_metrics
+                if k not in interface_columns and k != self.esmfold2_score_key
+            ]
+            extra_pairs = [("num_design", self.esmfold2_score_key)] + [
+                p for p in extra_pairs
+                if not set(p) & interface_columns
+                and p != ("num_design", self.esmfold2_score_key)
+            ]
 
         avail = [m for m in summary_metrics if m in self.df.columns]
         base_rows = [
@@ -890,10 +1037,16 @@ class Filter(Task):
 
         csv_expl_rows = [
             ["id", "filename to retrieve the file"],
-            ["design_sequence", "designed amino acids (may be subset of chain)"],
+            [
+                "designed_sequence",
+                "designed protein residues, with : separating chains",
+            ],
             [
                 "designed_chain_sequence",
-                "full sequence of the chain containing designed residues (recommended for synthesis)",
+                (
+                    "full protein sequences of chains containing designed residues; "
+                    ": separates chains (synthesize separately)"
+                ),
             ],
             ["num_design", "number of designed residues"],
             ["secondary_rank", "intermediate rank from the sorting procedure"],
@@ -929,6 +1082,28 @@ class Filter(Task):
         ]
 
         intro_text = text
+        if self.use_esmfold2:
+            score_label = "ESMFold2 ipSAE or pTM" if self.esmfold2_redesign else "ESMFold2 ipSAE"
+            intro_text = intro_text.replace("such as iPTM", f"such as {score_label}")
+            csv_expl_rows.insert(
+                2,
+                [
+                    self.esmfold2_score_key,
+                    "ESMFold2 2021 redesign: weakest chain-versus-rest ipSAE; native pTM for monomers (higher = better)"
+                    if self.esmfold2_redesign else
+                    "ESMFold2 2021: minimum directional ipSAE, PAE <10 Å; best of five samples by default (higher = better)",
+                ],
+            )
+            if self.esmfold2_redesign:
+                csv_expl_rows.insert(
+                    3,
+                    ["esmfold2_score_metric", "Metric used: weakest chain-versus-rest ipSAE, or native ESMFold2 pTM for monomers"],
+                )
+            else:
+                csv_expl_rows[3:3] = [
+                    ["esmfold2_design_to_target_ipsae", "Directional ipSAE, designed polymer toward the selected target"],
+                    ["esmfold2_target_to_design_ipsae", "Directional ipSAE, selected target toward the designed polymer"],
+                ]
 
         return (
             hist_metrics,
@@ -961,6 +1136,8 @@ class Filter(Task):
                 fig.set_size_inches(target_w, h * scale, forward=True)
 
         def show(fig):
+            if fig is None:
+                return
             _ensure_width(fig)
             plt.tight_layout()
             pdf.savefig(fig)
@@ -1112,7 +1289,7 @@ class Filter(Task):
         filters_df = pd.DataFrame(self.filters)
         filters_df["Pass"] = 0
         for i, filter in enumerate(self.filters):
-            filters_df.at[i, "Pass"] = self.df[f"pass_{filter['feature']}_filter"].sum()
+            filters_df.at[i, "Pass"] = self._filter_pass_mask(filter).sum()
 
         fig_height = 0.4 * len(filters_df) + 2
         fig, ax = plt.subplots(figsize=(8.5, fig_height))
@@ -1187,37 +1364,60 @@ class Filter(Task):
                     "hydrophobicity and charge composition comparing ALL, Top-quality (red), and Diversity-optimised subsets. "
                 ),
             )
-        vis = (
-            "designed_sequence"
-            if (
-                self.df["designed_chain_sequence"].str.len().mean()
-                > 1.5 * self.df["designed_sequence"].str.len().mean()
-            )
-            else "designed_chain_sequence"
-        )
-        seq_sets = [
-            (
-                f"All {len(self.df)} {vis}",
-                self.df[vis].tolist(),
-            ),
-            (
-                f"Top {self.top_budget} {vis}",
-                self.df[vis].tolist()[: self.top_budget],
-            ),
-            (
-                f"Diverse {self.budget} {vis}",
-                self.df_div[vis].tolist(),
-            ),
-        ]
         if self.plot_seq_logos:
-            for name, sequences in seq_sets:
-                show(create_alignment_logo(sequences, name))
-            for name, sequences in seq_sets:
-                show(aa_composition_pie(sequences, name))
+            # Select full-chain or redesigned-region views separately per chain.
+            # CDR concatenations are display-only; liabilities always use full chains.
+            def sequence_views(
+                frame: pd.DataFrame,
+            ) -> list[tuple[dict[str, str], dict[str, str]]]:
+                columns = [
+                    column
+                    for column in frame.columns
+                    if column in {"designed_chain_sequence", "designed_sequence"}
+                    or column.startswith(("full_sequence_", "designed_sequence_"))
+                ]
+                return [
+                    (
+                        _chain_sequences(row, full=True),
+                        _chain_sequences(row, full=False),
+                    )
+                    for _, row in frame[columns].iterrows()
+                ]
 
-            if self.modality == "antibody":
-                for name, sequences in seq_sets:
-                    show(cdr_logo(sequences, name))
+            all_views = sequence_views(self.df)
+            views_by_set = (
+                ("All", all_views),
+                ("Top", all_views[: self.top_budget]),
+                ("Diverse", sequence_views(self.df_div)),
+            )
+            chain_ids = dict.fromkeys(
+                chain_id for full, _ in all_views for chain_id in full
+            )
+            for chain_id in chain_ids:
+                full_length = sum(len(full.get(chain_id, "")) for full, _ in all_views)
+                designed_length = sum(
+                    len(designed.get(chain_id, "")) for _, designed in all_views
+                )
+                use_full = full_length <= 1.5 * designed_length
+                vis = "designed_chain_sequence" if use_full else "designed_sequence"
+                for name, views in views_by_set:
+                    sequences = [
+                        seq
+                        for full, designed in views
+                        if (seq := (full if use_full else designed).get(chain_id))
+                    ]
+                    if not sequences:
+                        continue
+                    title = f"{name} {len(sequences)} {vis}" + (
+                        f" chain {chain_id}" if chain_id else ""
+                    )
+                    show(create_alignment_logo(sequences, title))
+                    show(aa_composition_pie(sequences, title))
+                    if self.modality == "antibody":
+                        full_sequences = [
+                            seq for full, _ in views if (seq := full.get(chain_id))
+                        ]
+                        show(cdr_logo(full_sequences, title))
 
         section_page(
             "Scatter Plots – Metric relationships",
@@ -1276,28 +1476,28 @@ class Filter(Task):
                     "attention during optimisation."
                 ),
             )
-        # Plot Liability Heatmaps for Top-budget subset
-        for idx, row in tqdm(
-            enumerate(self.df[: self.num_liability_plots].itertuples(index=False)),
-            desc=f"Making liability plots for top {self.num_liability_plots} sequences.",
-        ):
-            seq = row.designed_sequence
-            try:
-                res = compute_liability_scores(
-                    [seq], modality=self.modality, peptide_type=self.peptide_type
-                )
-                liab = res.get(seq, {"score": None, "violations": []})
-                fig = plot_seq_liabilities(
-                    seq,
-                    f"Qualityrank {idx} {row.id}",
-                    liab["violations"],
-                    total_score=liab["score"],
-                )
-                show(fig)
-            except Exception as e:
-                print(f"  Error processing  {seq[:20]}: {e}")
-                plt.close("all")
-                continue
+        # Match analysis: scan each complete designed protein chain independently.
+        for idx, (_, row) in enumerate(self.df[: self.num_liability_plots].iterrows()):
+            for chain_id, seq in _chain_sequences(row, full=True).items():
+                try:
+                    res = compute_liability_scores(
+                        [seq], modality=self.modality, peptide_type=self.peptide_type
+                    )
+                    liab = res[seq]
+                    title = f"Qualityrank {idx} {row['id']}" + (
+                        f" chain {chain_id}" if chain_id else ""
+                    )
+                    show(
+                        plot_seq_liabilities(
+                            seq,
+                            title,
+                            liab["violations"],
+                            total_score=liab["score"],
+                        )
+                    )
+                except Exception as e:  # noqa: PERF203 - isolate failed chain plots
+                    print(f"  Error processing {seq[:20]}: {e}")
+                    plt.close("all")
 
         pdf.close()
 
