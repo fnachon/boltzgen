@@ -717,7 +717,7 @@ def configure_command(args: argparse.Namespace) -> None:
     * `<output_dir>/steps.yaml` — manifest of steps and config file paths.
 
     This stage prepares the YAMLs used by `execute_command(...)`. Fresh polymer
-    runs also prepare the isolated ESM runtime and check CUDA availability;
+    runs also prepare the isolated ESM runtime and check GPU (CUDA or Metal) availability;
     they do not load model weights or run inference here.
 
     Usually this is executed by `boltzgen run ...` but it can be used like:
@@ -760,7 +760,7 @@ def configure_command(args: argparse.Namespace) -> None:
             # Reuse can finish entirely from saved scores. Provision that run's
             # runtime only if the scoring task finds work still to compute.
             if not esm_config.reuse:
-                resolve_python(esm_config.python, require_cuda=True)
+                resolve_python(esm_config.python, require_gpu=True)
 
     # Make the config subdir in output
     config_dir = output_dir / "config"
